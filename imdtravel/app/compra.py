@@ -1,10 +1,20 @@
 import json
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from app.clientes import buscar_voo, creditar_bonus, obter_taxa, vender
+from app.vendas import registrar
 
 
 def _eh_2xx(status_code: int) -> bool:
     return 200 <= status_code < 300
+
+
+def _timestamp_utc_ms() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, object]]:
@@ -36,11 +46,22 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
     if not _eh_2xx(resp_bonus.status_code):
         raise RuntimeError(f"Fidelity /bonus retornou status {resp_bonus.status_code}")
 
-    # passo 7: gravar a venda (será feito no passo 4)
-
     value_brl = (Decimal(str(price_usd)) * Decimal(str(rate))).quantize(
         Decimal("0.01"),
         rounding=ROUND_HALF_UP,
+    )
+
+    registrar(
+        {
+            "correlationId": cid,
+            "transactionId": transaction_id,
+            "flight": flight,
+            "day": day,
+            "user": user,
+            "valueUSD": float(price_usd),
+            "valueBRL": float(value_brl),
+            "ts": _timestamp_utc_ms(),
+        }
     )
 
     corpo: dict[str, object] = {

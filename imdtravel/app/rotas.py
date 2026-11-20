@@ -8,6 +8,7 @@ from werkzeug.exceptions import HTTPException
 from app.compra import comprar
 from app.config import SALES_DIR
 from app.instrumentacao import log, registrar_instrumentacao
+from app.vendas import listar
 
 app = Flask(__name__)
 app.json.sort_keys = False
@@ -54,6 +55,11 @@ def health():
 
     uptime_s = int(time.monotonic() - _START_TIME)
     return jsonify({"status": "ok", "uptimeS": uptime_s}), 200
+
+
+@app.get("/sales")
+def sales():
+    return jsonify(listar()), 200
 
 
 @app.post("/buyTicket")
