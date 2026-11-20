@@ -1,12 +1,16 @@
+import json
 import os
 import tempfile
 import time
-from flask import Flask, jsonify, request
+from decimal import Decimal
+from flask import Flask, Response, g, jsonify, request
 from werkzeug.exceptions import HTTPException
+from app.compra import comprar
 from app.config import SALES_DIR
 from app.instrumentacao import log, registrar_instrumentacao
 
 app = Flask(__name__)
+app.json.sort_keys = False
 registrar_instrumentacao(app)
 
 _START_TIME = time.monotonic()
@@ -27,6 +31,19 @@ def _check_sales_dir() -> tuple[bool, str]:
 
 def _texto_nao_vazio(valor: object) -> bool:
     return isinstance(valor, str) and bool(valor.strip())
+
+
+def _json_com_numeros_exatos(corpo: dict[str, object]) -> str:
+    # O testes.sh compara o texto dos números (350.50 não é igual a 350.5),
+    # então os Decimal são escritos exatamente como foram recebidos.
+    partes = []
+    for chave, valor in corpo.items():
+        if isinstance(valor, Decimal):
+            texto = format(valor, "f")
+        else:
+            texto = json.dumps(valor, ensure_ascii=False)
+        partes.append(f"{json.dumps(chave)}:{texto}")
+    return "{" + ",".join(partes) + "}"
 
 
 @app.get("/health")
@@ -52,7 +69,19 @@ def buy_ticket():
     ):
         return jsonify({"error": "invalid-request"}), 400
 
-    return jsonify({"error": "not-implemented"}), 501
+    status, resposta = comprar(
+        corpo["flight"].strip(),
+        corpo["day"].strip(),
+        corpo["user"].strip(),
+        g.cid,
+    )
+    if status == 201:
+        return Response(
+            _json_com_numeros_exatos(resposta),
+            status=201,
+            mimetype="application/json",
+        )
+    return jsonify(resposta), status
 
 
 @app.errorhandler(Exception)
