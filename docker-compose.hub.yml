@@ -1,0 +1,71 @@
+# IMDTravel — Parte 1 (BASELINE), usando as imagens publicadas no Docker Hub.
+#
+# Para quem só quer rodar o sistema:
+#   1. baixe só este arquivo numa pasta vazia, com o nome docker-compose.yml
+#   2. docker compose -f docker-compose.hub.yml up -d --wait
+#   3. curl http://localhost:8080/health
+#
+# Dentro do repositório: docker compose -f docker-compose.hub.yml up -d --wait
+#
+# Imagens para linux/amd64 e linux/arm64 — rodam também no Windows (Docker Desktop
+# com WSL 2) e em Macs Apple Silicon. Para outra versão: IMAGE_TAG=... docker compose up
+
+x-healthcheck: &healthcheck
+  test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health"]
+  interval: 5s
+  timeout: 3s
+  retries: 5
+  start_period: 40s
+
+services:
+  airlineshub:
+    image: gibeonufrn/imdtravel-airlineshub:${IMAGE_TAG:-baseline}
+    environment:
+      PORT: 8080
+      CATALOG_FLIGHTS: ${CATALOG_FLIGHTS:-IMD100,IMD200,IMD300}
+      CATALOG_BASE_PRICES: ${CATALOG_BASE_PRICES:-350.50,420.50,510.50}
+      CATALOG_PRICE_STEP_PER_DAY: ${CATALOG_PRICE_STEP_PER_DAY:-12.25}
+      CATALOG_START_DATE: ${CATALOG_START_DATE:-2026-12-01}
+      CATALOG_DAYS: ${CATALOG_DAYS:-7}
+      CATALOG_SEATS: ${CATALOG_SEATS:-20}
+      SELL_MIN_MS: ${SELL_MIN_MS:-300}
+      SELL_MAX_MS: ${SELL_MAX_MS:-900}
+    healthcheck: *healthcheck
+
+  exchange:
+    image: gibeonufrn/imdtravel-exchange:${IMAGE_TAG:-baseline}
+    environment:
+      PORT: 8080
+      EXCHANGE_INITIAL_RATE: ${EXCHANGE_INITIAL_RATE:-5.50}
+      EXCHANGE_TICK_S: ${EXCHANGE_TICK_S:-10}
+      EXCHANGE_MAX_STEP_PCT: ${EXCHANGE_MAX_STEP_PCT:-0.3}
+      EXCHANGE_MIN: ${EXCHANGE_MIN:-5.00}
+      EXCHANGE_MAX: ${EXCHANGE_MAX:-6.00}
+    healthcheck: *healthcheck
+
+  fidelity:
+    image: gibeonufrn/imdtravel-fidelity:${IMAGE_TAG:-baseline}
+    environment:
+      PORT: 8080
+    healthcheck: *healthcheck
+
+  imdtravel:
+    image: gibeonufrn/imdtravel-imdtravel:${IMAGE_TAG:-baseline}
+    environment:
+      PORT: 8080
+      SALES_DIR: /data
+      AIRLINESHUB_URL: http://airlineshub:8080
+      EXCHANGE_URL: http://exchange:8080
+      FIDELITY_URL: http://fidelity:8080
+    ports:
+      - "${IMDTRAVEL_HOST_PORT:-8080}:8080"   # a única porta exposta ao hospedeiro
+    volumes:
+      - sales-data:/data
+    healthcheck: *healthcheck
+    depends_on:
+      airlineshub: { condition: service_healthy }
+      exchange:    { condition: service_healthy }
+      fidelity:    { condition: service_healthy }
+
+volumes:
+  sales-data:
