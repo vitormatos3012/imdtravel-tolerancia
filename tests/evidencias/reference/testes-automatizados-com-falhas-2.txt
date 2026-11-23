@@ -8,7 +8,7 @@
   ok fidelity: status ok e uptimeS numérico
 
 == 2. Uma compra bem-sucedida
-  par: IMD100 2026-12-01   usuário: r1795318141-ana   cid: r1795318141-cid-1
+  par: IMD100 2026-12-01   usuário: r1795397980-ana   cid: r1795397980-cid-1
   ok status 201
   ok resposta tem os 9 campos, nenhum nulo
   ok flight, day e user ecoam o pedido

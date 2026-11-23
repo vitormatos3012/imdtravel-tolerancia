@@ -1,3 +1,6 @@
+
+== Subindo o sistema do zero (down -v, up --build --wait)
+
 == 1. GET /health nos quatro serviços
   ok imdtravel: status ok e uptimeS numérico
   ok airlineshub: status ok e uptimeS numérico
@@ -5,7 +8,7 @@
   ok fidelity: status ok e uptimeS numérico
 
 == 2. Uma compra bem-sucedida
-  par: IMD100 2026-12-01   usuário: r1795314226-ana   cid: r1795314226-cid-1
+  par: IMD100 2026-12-01   usuário: r1795397825-ana   cid: r1795397825-cid-1
   ok status 201
   ok resposta tem os 9 campos, nenhum nulo
   ok flight, day e user ecoam o pedido

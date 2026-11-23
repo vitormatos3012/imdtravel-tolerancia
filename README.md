@@ -7,8 +7,8 @@
 
 ## Linguagem e Framework
 
- - Python 3.13
- - FastAPI
+ - Python 3.12
+ - Flask
 
 ## Testes realizados
 
