@@ -52,19 +52,19 @@ Comando usado para obter os logs da requisição com falha:
 
 ```bash
 docker compose logs --no-log-prefix imdtravel |
-  grep '005b6333-676b-4b83-b99f-15f8dc1fb319'
+  grep 'evidence-internal-error-20261123'
 ```
 
 Saída exata:
 
 ```text
-{"ts": "2026-11-23T01:38:11.310Z", "svc": "imdtravel", "cid": "005b6333-676b-4b83-b99f-15f8dc1fb319", "event": "requisicao.recebida", "ms": 0, "method": "POST", "path": "/buyTicket"}
-{"ts": "2026-11-23T01:38:11.320Z", "svc": "imdtravel", "cid": "005b6333-676b-4b83-b99f-15f8dc1fb319", "event": "dependencia.resposta", "ms": 9.4, "alvo": "airlineshub", "path": "/flight", "status": 200}
-{"ts": "2026-11-23T01:38:11.331Z", "svc": "imdtravel", "cid": "005b6333-676b-4b83-b99f-15f8dc1fb319", "event": "dependencia.resposta", "ms": 10.55, "alvo": "exchange", "path": "/convert", "status": 200}
-{"ts": "2026-11-23T01:38:12.203Z", "svc": "imdtravel", "cid": "005b6333-676b-4b83-b99f-15f8dc1fb319", "event": "dependencia.resposta", "ms": 872.37, "alvo": "airlineshub", "path": "/sell", "status": 201}
-{"ts": "2026-11-23T01:38:12.334Z", "svc": "imdtravel", "cid": "005b6333-676b-4b83-b99f-15f8dc1fb319", "event": "dependencia.falha", "ms": 131.1, "alvo": "fidelity", "path": "/bonus", "erro": "HTTPConnectionPool(host='fidelity', port=8080): Max retries exceeded with url: /bonus (Caused by NameResolutionError(\"HTTPConnection(host='fidelity', port=8080): Failed to resolve 'fidelity' ([Errno -5] No address associated with hostname)\"))"}
-{"ts": "2026-11-23T01:38:12.335Z", "svc": "imdtravel", "cid": "005b6333-676b-4b83-b99f-15f8dc1fb319", "event": "erro.nao_tratado", "ms": 0, "error": "HTTPConnectionPool(host='fidelity', port=8080): Max retries exceeded with url: /bonus (Caused by NameResolutionError(\"HTTPConnection(host='fidelity', port=8080): Failed to resolve 'fidelity' ([Errno -5] No address associated with hostname)\"))"}
-{"ts": "2026-11-23T01:38:12.335Z", "svc": "imdtravel", "cid": "005b6333-676b-4b83-b99f-15f8dc1fb319", "event": "resposta.enviada", "ms": 1024.49, "path": "/buyTicket", "status": 500}
+{"ts": "2026-11-23T02:14:27.550Z", "svc": "imdtravel", "cid": "evidence-internal-error-20261123", "event": "requisicao.recebida", "ms": 0, "method": "POST", "path": "/buyTicket"}
+{"ts": "2026-11-23T02:14:27.556Z", "svc": "imdtravel", "cid": "evidence-internal-error-20261123", "event": "dependencia.resposta", "ms": 5.07, "alvo": "airlineshub", "path": "/flight", "status": 200}
+{"ts": "2026-11-23T02:14:27.560Z", "svc": "imdtravel", "cid": "evidence-internal-error-20261123", "event": "dependencia.resposta", "ms": 3.84, "alvo": "exchange", "path": "/convert", "status": 200}
+{"ts": "2026-11-23T02:14:28.068Z", "svc": "imdtravel", "cid": "evidence-internal-error-20261123", "event": "dependencia.resposta", "ms": 508.3, "alvo": "airlineshub", "path": "/sell", "status": 201}
+{"ts": "2026-11-23T02:14:28.134Z", "svc": "imdtravel", "cid": "evidence-internal-error-20261123", "event": "dependencia.falha", "ms": 66.27, "alvo": "fidelity", "path": "/bonus", "erro": "HTTPConnectionPool(host='fidelity', port=8080): Max retries exceeded with url: /bonus (Caused by NameResolutionError(\"HTTPConnection(host='fidelity', port=8080): Failed to resolve 'fidelity' ([Errno -5] No address associated with hostname)\"))"}
+{"ts": "2026-11-23T02:14:28.135Z", "svc": "imdtravel", "cid": "evidence-internal-error-20261123", "event": "erro.nao_tratado", "ms": 0, "error": "HTTPConnectionPool(host='fidelity', port=8080): Max retries exceeded with url: /bonus (Caused by NameResolutionError(\"HTTPConnection(host='fidelity', port=8080): Failed to resolve 'fidelity' ([Errno -5] No address associated with hostname)\"))"}
+{"ts": "2026-11-23T02:14:28.135Z", "svc": "imdtravel", "cid": "evidence-internal-error-20261123", "event": "resposta.enviada", "ms": 584.59, "path": "/buyTicket", "status": 500}
 ```
 
 ### Referência
