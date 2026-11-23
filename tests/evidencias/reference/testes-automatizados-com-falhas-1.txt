@@ -1,0 +1,64 @@
+
+== Subindo o sistema do zero (down -v, up --build --wait)
+
+== 1. GET /health nos quatro serviços
+  ok imdtravel: status ok e uptimeS numérico
+  ok airlineshub: status ok e uptimeS numérico
+  ok exchange: status ok e uptimeS numérico
+  ok fidelity: status ok e uptimeS numérico
+
+== 2. Uma compra bem-sucedida
+  par: IMD100 2026-12-01   usuário: r1795397825-ana   cid: r1795397825-cid-1
+  ok status 201
+  ok resposta tem os 9 campos, nenhum nulo
+  ok flight, day e user ecoam o pedido
+  ok valueBRL = valueUSD × rate (2 casas)
+  ok bonus = parte inteira de valueUSD
+  ok rate na faixa de 5,00 a 6,00
+  ok X-Correlation-Id devolvido é o enviado
+  ok estoque baixou exatamente 1
+  ok GET /sales ganhou exatamente 1 linha
+  ok a linha de /sales tem o cid da compra
+  ok a linha de /sales tem transactionId, par, usuário, valores e instante
+  ok Fidelity creditou o bônus ao usuário
+  ok a entrada no Fidelity tem o mesmo cid (propagado até a chamada 4)
+
+== 3. Sem X-Correlation-Id, o IMDTravel gera um
+  ok status 201
+  ok cabeçalho X-Correlation-Id presente na resposta
+  ok o cid gerado aparece em GET /sales
+
+== 4. Preço determinístico e taxa estável entre dois ticks
+  ok duas consultas ao mesmo par dão o mesmo preço
+  ok a compra usou esse preço
+  ok duas leituras com o mesmo asOf têm a mesma taxa
+
+== 5. Pedidos inválidos não consomem assento nem geram venda
+  ok voo inexistente → 404
+  ok corpo do 404 é { error: not-found }
+  ok dia fora do catálogo → 404
+  ok sem o campo day → 400
+  ok corpo do 400 é { error: invalid-request }
+  ok user vazio → 400
+  ok JSON malformado → 400
+  ok estoque inalterado
+  ok GET /sales inalterado
+
+== 6. Esgotamento sob concorrência
+  par: IMD100 2026-12-02   25 compras simultâneas para 20 assentos
+  ok respostas 201
+  ok respostas 409
+  ok nenhuma outra resposta
+  ok estoque terminou em 0 (nunca negativo)
+  ok GET /sales ganhou exatamente 20 linhas
+  ok mais uma compra no par esgotado → 409
+  ok corpo do 409 é { error: sold-out }
+  ok quem recebeu 409 não ganhou bônus
+
+== 7. Fidelity parado: falha depois do passo irreversível
+  a compra levou 39s para responder
+  ok a compra devolveu 500
+  ok o assento foi consumido mesmo assim
+  ok nenhuma linha nova em GET /sales
+
+== Resumo: 43 passaram, 0 falharam
