@@ -1,5 +1,7 @@
-# IMDTravel — Parte 1 (BASELINE).
-# Três serviços vêm de imagens do Docker Hub; o imdtravel é construído a partir de ./imdtravel.
+# IMDTravel — Parte 2 (versão tolerante a falhas).
+# AirlinesHub, Exchange e Fidelity vêm de imagens do Docker Hub (tag parte2: com injeção de
+# falhas, desligada por padrão). O imdtravel é construído a partir de ./imdtravel.
+# Ligar uma falha: ver FALHAS.md do professor e o cenario.sh. Imagens da Parte 1: IMAGE_TAG=baseline.
 
 x-healthcheck: &healthcheck
   test: ["CMD-SHELL", "curl -fsS http://localhost:$${PORT}/health"]
@@ -10,7 +12,7 @@ x-healthcheck: &healthcheck
 
 services:
   airlineshub:
-    image: gibeonufrn/imdtravel-airlineshub:${IMAGE_TAG:-baseline}
+    image: gibeonufrn/imdtravel-airlineshub:${IMAGE_TAG:-parte2}
     environment:
       PORT: 8080
       CATALOG_FLIGHTS: ${CATALOG_FLIGHTS:-IMD100,IMD200,IMD300}
@@ -21,12 +23,17 @@ services:
       CATALOG_SEATS: ${CATALOG_SEATS:-20}
       SELL_MIN_MS: ${SELL_MIN_MS:-300}
       SELL_MAX_MS: ${SELL_MAX_MS:-900}
+      # Injeção de falhas. Tipos fixos: /flight = Tempo, /sell = Omissão.
+      FAULT_FLIGHT_P: ${FAULT_FLIGHT_P:-0}
+      FAULT_FLIGHT_TTL_SEC: ${FAULT_FLIGHT_TTL_SEC:-0}
+      FAULT_SELL_P: ${FAULT_SELL_P:-0}
+      FAULT_SELL_TTL_SEC: ${FAULT_SELL_TTL_SEC:-0}
     healthcheck: *healthcheck
     networks:
       - imdtravel-net
 
   exchange:
-    image: gibeonufrn/imdtravel-exchange:${IMAGE_TAG:-baseline}
+    image: gibeonufrn/imdtravel-exchange:${IMAGE_TAG:-parte2}
     environment:
       PORT: 8080
       EXCHANGE_INITIAL_RATE: ${EXCHANGE_INITIAL_RATE:-5.50}
@@ -34,26 +41,58 @@ services:
       EXCHANGE_MAX_STEP_PCT: ${EXCHANGE_MAX_STEP_PCT:-0.3}
       EXCHANGE_MIN: ${EXCHANGE_MIN:-5.00}
       EXCHANGE_MAX: ${EXCHANGE_MAX:-6.00}
+      # Injeção de falhas. Tipo fixo: /convert = Resposta.
+      FAULT_CONVERT_P: ${FAULT_CONVERT_P:-0}
+      FAULT_CONVERT_TTL_SEC: ${FAULT_CONVERT_TTL_SEC:-0}
     healthcheck: *healthcheck
     networks:
       - imdtravel-net
 
   fidelity:
-    image: gibeonufrn/imdtravel-fidelity:${IMAGE_TAG:-baseline}
+    image: gibeonufrn/imdtravel-fidelity:${IMAGE_TAG:-parte2}
     environment:
       PORT: 8080
+      # Injeção de falhas. Tipo fixo: /bonus = Crash.
+      FAULT_BONUS_P: ${FAULT_BONUS_P:-0}
+      FAULT_BONUS_TTL_SEC: ${FAULT_BONUS_TTL_SEC:-0}
     healthcheck: *healthcheck
     networks:
       - imdtravel-net
 
   imdtravel:
     build: ./imdtravel
+    restart: unless-stopped
     environment:
       PORT: 8080
       SALES_DIR: /data
+      DB_PATH: /data/imdtravel.db
       AIRLINESHUB_URL: http://airlineshub:8080
       EXCHANGE_URL: http://exchange:8080
       FIDELITY_URL: http://fidelity:8080
+      # Estratégias de tolerância (valores e justificativas: README). Tudo configurável aqui.
+      DEADLINE_MS: ${DEADLINE_MS:-5000}
+      DEADLINE_MARGIN_MS: ${DEADLINE_MARGIN_MS:-500}
+      FLIGHT_TIMEOUT_MS: ${FLIGHT_TIMEOUT_MS:-1000}
+      PRICE_CACHE_MAX_AGE_S: ${PRICE_CACHE_MAX_AGE_S:-3600}
+      CONVERT_TIMEOUT_MS: ${CONVERT_TIMEOUT_MS:-500}
+      CONVERT_MAX_ATTEMPTS: ${CONVERT_MAX_ATTEMPTS:-2}
+      RETRY_BACKOFF_MS: ${RETRY_BACKOFF_MS:-100}
+      RETRY_JITTER_MS: ${RETRY_JITTER_MS:-50}
+      RATE_MIN: ${RATE_MIN:-5.0}
+      RATE_MAX: ${RATE_MAX:-6.0}
+      RATE_CACHE_MAX_AGE_S: ${RATE_CACHE_MAX_AGE_S:-60}
+      SELL_TIMEOUT_MS: ${SELL_TIMEOUT_MS:-1500}
+      SELL_MIN_START_MS: ${SELL_MIN_START_MS:-1000}
+      BONUS_INLINE_TIMEOUT_MS: ${BONUS_INLINE_TIMEOUT_MS:-800}
+      BONUS_QUEUE_MAX: ${BONUS_QUEUE_MAX:-1000}
+      BONUS_BACKOFF_INITIAL_MS: ${BONUS_BACKOFF_INITIAL_MS:-500}
+      BONUS_BACKOFF_MAX_MS: ${BONUS_BACKOFF_MAX_MS:-10000}
+      BONUS_WORKER_TIMEOUT_MS: ${BONUS_WORKER_TIMEOUT_MS:-2000}
+      BREAKER_THRESHOLD: ${BREAKER_THRESHOLD:-3}
+      BREAKER_LEAK_PER_S: ${BREAKER_LEAK_PER_S:-0.1}
+      BREAKER_OPEN_S: ${BREAKER_OPEN_S:-10}
+      MAX_INFLIGHT: ${MAX_INFLIGHT:-50}
+      RETRY_AFTER_S: ${RETRY_AFTER_S:-1}
     ports:
       - "${IMDTRAVEL_HOST_PORT:-8080}:8080"   # a única porta exposta ao hospedeiro
     volumes:
