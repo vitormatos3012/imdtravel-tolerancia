@@ -1,16 +1,21 @@
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
+import json
 import random
 import time
 from app.caches import CACHE_PRECO, CACHE_TAXA
 from app.clientes import buscar_voo, creditar_bonus, obter_taxa, vender
 from app.config import CONFIG
+from app.estado import ESTADO, Linha
 from app.instrumentacao import log
 from app.prazo import Prazo
 from app.resposta import (
     PRICE_FROM_CACHE,
     RATE_FROM_CACHE,
     corpo_201,
+    corpo_202,
+    corpo_em_andamento,
+    json_exato,
     recusa_503,
 )
 from app.vendas import registrar
@@ -35,7 +40,23 @@ def _aleatorio_ms(maximo: float) -> float:
     return random.uniform(0.0, maximo)
 
 
+def _responder_de_linha(linha: Linha, cid: str) -> tuple[int, dict[str, object]]:
+    if linha.estado in ("SOLD", "UNCERTAIN", "NOT_SOLD"):
+        log("compra.repetida", cid=cid, estado=linha.estado)
+        assert linha.resposta_status is not None
+        assert linha.resposta_corpo is not None
+        corpo = json.loads(linha.resposta_corpo, parse_float=Decimal)
+        assert isinstance(corpo, dict)
+        return linha.resposta_status, corpo
+    return 503, corpo_em_andamento(cid)
+
+
 def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, object]]:
+    # 0) Idempotência
+    linha_existente = ESTADO.buscar(cid, flight, day, user)
+    if linha_existente is not None:
+        return _responder_de_linha(linha_existente, cid)
+
     prazo = Prazo(CONFIG.deadline_ms, CONFIG.deadline_margin_ms)
     degradations: list[str] = []
 
@@ -114,21 +135,107 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
             erro_taxa = "no-time" if tentativas_realizadas == 0 else "rate-unavailable"
             return 503, recusa_503(erro_taxa, cid)
 
+    bonus = int(price_usd)
+    value_brl = (Decimal(str(price_usd)) * Decimal(str(rate))).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+
     # 3) /sell
     if not prazo.cabe(CONFIG.sell_min_start_ms):
         return 503, recusa_503("no-time", cid)
     t_venda = prazo.timeout_ms(CONFIG.sell_timeout_ms)
     if t_venda is None:
         return 503, recusa_503("no-time", cid)
-    res_venda = vender(flight, day, cid, t_venda)
-    if res_venda.tipo == "definitivo" and res_venda.status == 409:
-        return 409, {"error": "sold-out"}
-    if res_venda.tipo != "ok" or res_venda.dados is None:
-        raise RuntimeError(f"AirlinesHub /sell: {res_venda.motivo}")
-    transaction_id = res_venda.dados["transactionId"]
+
+    criado, existente = ESTADO.iniciar_compra(cid, flight, day, user)
+    if not criado:
+        assert existente is not None
+        return _responder_de_linha(existente, cid)
+
+    concluida = False
+    try:
+        res_venda = vender(flight, day, cid, t_venda)
+
+        if res_venda.tipo == "ok" and res_venda.dados is not None:
+            transaction_id = res_venda.dados["transactionId"]
+            assert isinstance(transaction_id, str)
+            corpo = corpo_201(
+                transaction_id=transaction_id,
+                flight=flight,
+                day=day,
+                user=user,
+                price_usd=price_usd,
+                value_brl=value_brl,
+                rate=rate,
+                rate_as_of=as_of,
+                bonus=bonus,
+                degradations=degradations,
+            )
+            ESTADO.concluir_vendida(
+                cid,
+                flight,
+                day,
+                user,
+                transaction_id,
+                bonus,
+                201,
+                json_exato(corpo),
+            )
+            concluida = True
+            registrar(
+                {
+                    "correlationId": cid,
+                    "transactionId": transaction_id,
+                    "flight": flight,
+                    "day": day,
+                    "user": user,
+                    "valueUSD": float(price_usd),
+                    "valueBRL": float(value_brl),
+                    "ts": _timestamp_utc_ms(),
+                }
+            )
+        elif res_venda.tipo == "definitivo" and res_venda.status == 409:
+            corpo_esgotado: dict[str, object] = {"error": "sold-out"}
+            ESTADO.concluir_nao_vendida(
+                cid,
+                flight,
+                day,
+                user,
+                409,
+                json_exato(corpo_esgotado),
+            )
+            concluida = True
+            return 409, corpo_esgotado
+        elif res_venda.tipo == "falha_segura":
+            ESTADO.liberar(cid, flight, day, user)
+            concluida = True
+            return 503, recusa_503("sell-unavailable", cid)
+        else:
+            corpo_incerto = corpo_202(cid, flight, day, user, degradations)
+            ESTADO.concluir_incerta(
+                cid,
+                flight,
+                day,
+                user,
+                202,
+                json_exato(corpo_incerto),
+            )
+            concluida = True
+            log("venda.incerta", cid=cid, motivo=res_venda.motivo)
+            return 202, corpo_incerto
+    finally:
+        if not concluida:
+            ESTADO.concluir_incerta(
+                cid,
+                flight,
+                day,
+                user,
+                202,
+                json_exato(corpo_202(cid, flight, day, user, degradations)),
+            )
 
     # 4) /bonus
-    bonus = int(price_usd)
     t_bonus = prazo.timeout_ms(CONFIG.bonus_inline_timeout_ms)
     if t_bonus is None:
         raise RuntimeError("Fidelity /bonus: sem_tempo")
@@ -136,37 +243,9 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
     if res_bonus.tipo != "ok":
         raise RuntimeError(f"Fidelity /bonus: {res_bonus.motivo}")
 
-    value_brl = (Decimal(str(price_usd)) * Decimal(str(rate))).quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP,
-    )
-
-    registrar(
-        {
-            "correlationId": cid,
-            "transactionId": transaction_id,
-            "flight": flight,
-            "day": day,
-            "user": user,
-            "valueUSD": float(price_usd),
-            "valueBRL": float(value_brl),
-            "ts": _timestamp_utc_ms(),
-        }
-    )
+    ESTADO.marcar_bonus_creditado(cid, flight, day, user)
 
     if degradations:
         log("compra.degradada", cid=cid, degradations=list(degradations))
 
-    corpo = corpo_201(
-        transaction_id=transaction_id,
-        flight=flight,
-        day=day,
-        user=user,
-        price_usd=price_usd,
-        value_brl=value_brl,
-        rate=rate,
-        rate_as_of=as_of,
-        bonus=bonus,
-        degradations=degradations,
-    )
     return 201, corpo

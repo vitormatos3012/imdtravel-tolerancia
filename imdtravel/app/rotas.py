@@ -1,13 +1,12 @@
-import json
 import os
 import tempfile
 import time
-from decimal import Decimal
 from flask import Flask, Response, g, jsonify, request
 from werkzeug.exceptions import HTTPException
 from app.compra import comprar
 from app.config import CONFIG, SALES_DIR
 from app.instrumentacao import log, registrar_instrumentacao
+from app.resposta import json_exato
 from app.vendas import listar
 
 app = Flask(__name__)
@@ -32,19 +31,6 @@ def _check_sales_dir() -> tuple[bool, str]:
 
 def _texto_nao_vazio(valor: object) -> bool:
     return isinstance(valor, str) and bool(valor.strip())
-
-
-def _json_com_numeros_exatos(corpo: dict[str, object]) -> str:
-    # O testes.sh compara o texto dos números (350.50 não é igual a 350.5),
-    # então os Decimal são escritos exatamente como foram recebidos.
-    partes = []
-    for chave, valor in corpo.items():
-        if isinstance(valor, Decimal):
-            texto = format(valor, "f")
-        else:
-            texto = json.dumps(valor, ensure_ascii=False)
-        partes.append(f"{json.dumps(chave)}:{texto}")
-    return "{" + ",".join(partes) + "}"
 
 
 @app.get("/health")
@@ -83,7 +69,7 @@ def buy_ticket():
     )
     if status == 201:
         return Response(
-            _json_com_numeros_exatos(resposta),
+            json_exato(resposta),
             status=201,
             mimetype="application/json",
         )

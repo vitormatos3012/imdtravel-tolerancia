@@ -1,7 +1,22 @@
 from decimal import Decimal
+import json
 
 PRICE_FROM_CACHE = "price-from-cache"
 RATE_FROM_CACHE = "rate-from-cache"
+SALE_UNCONFIRMED = "sale-unconfirmed"
+
+
+def json_exato(corpo: dict[str, object]) -> str:
+    # O testes.sh compara o texto dos números (350.50 não é igual a 350.5),
+    # então os Decimal são escritos exatamente como foram recebidos.
+    partes = []
+    for chave, valor in corpo.items():
+        if isinstance(valor, Decimal):
+            texto = format(valor, "f")
+        else:
+            texto = json.dumps(valor, ensure_ascii=False)
+        partes.append(f"{json.dumps(chave)}:{texto}")
+    return "{" + ",".join(partes) + "}"
 
 
 def corpo_201(
@@ -31,6 +46,35 @@ def corpo_201(
         corpo["degraded"] = True
         corpo["degradations"] = list(degradations)
     return corpo
+
+
+def corpo_202(
+    cid: str,
+    flight: str,
+    day: str,
+    user: str,
+    degradations: list[str],
+) -> dict[str, object]:
+    lista_degradacoes = list(degradations)
+    if SALE_UNCONFIRMED not in lista_degradacoes:
+        lista_degradacoes.append(SALE_UNCONFIRMED)
+    return {
+        "outcome": "unknown",
+        "message": "A venda pode ou não ter sido concluída. Não repita a compra; consulte o suporte com o correlationId.",
+        "correlationId": cid,
+        "flight": flight,
+        "day": day,
+        "user": user,
+        "degraded": True,
+        "degradations": lista_degradacoes,
+    }
+
+
+def corpo_em_andamento(cid: str) -> dict[str, object]:
+    return {
+        "error": "purchase-in-progress",
+        "correlationId": cid,
+    }
 
 
 def recusa_503(erro: str, cid: str) -> dict[str, object]:

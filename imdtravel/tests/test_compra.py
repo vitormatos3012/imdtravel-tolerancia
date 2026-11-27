@@ -1,5 +1,6 @@
 from decimal import Decimal
 import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +12,7 @@ from app.caches import CachePreco, CacheTaxa
 from app.clientes import Resultado
 from app.compra import comprar
 from app.config import CONFIG
+from app.estado import Estado
 
 
 class _RelogioFalso:
@@ -86,10 +88,18 @@ def _ok_bonus() -> Resultado:
 
 class TestCompra(unittest.TestCase):
     def setUp(self) -> None:
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+
         self.relogio = _RelogioFalso(1000.0)
         self.cache_preco = CachePreco(relogio=self.relogio)
         self.cache_taxa = CacheTaxa(relogio=self.relogio)
+        self.estado = Estado(
+            os.path.join(self.tmp_dir.name, "compras.db"),
+            relogio=self.relogio,
+        )
 
+        self.p_estado = patch("app.compra.ESTADO", self.estado)
         self.p_cache_preco = patch("app.compra.CACHE_PRECO", self.cache_preco)
         self.p_cache_taxa = patch("app.compra.CACHE_TAXA", self.cache_taxa)
         self.p_buscar_voo = patch("app.compra.buscar_voo", return_value=_ok_voo())
@@ -102,6 +112,7 @@ class TestCompra(unittest.TestCase):
         self.p_dormir = patch("app.compra._dormir_ms")
         self.p_aleatorio = patch("app.compra._aleatorio_ms", return_value=0.0)
 
+        self.m_estado = self.p_estado.start()
         self.m_cache_preco = self.p_cache_preco.start()
         self.m_cache_taxa = self.p_cache_taxa.start()
         self.m_buscar_voo = self.p_buscar_voo.start()
@@ -252,7 +263,7 @@ class TestCompra(unittest.TestCase):
         )
         self.assertEqual(corpo["valueBRL"], Decimal("810.00"))
 
-    def test_11_sell_sem_tempo_devolve_503_no_time(self) -> None:
+    def test_11_sell_sem_tempo_devolve_503_no_time_sem_criar_linha(self) -> None:
         prazo_falso = MagicMock()
         prazo_falso.timeout_ms.side_effect = [1000.0, 500.0]
         prazo_falso.cabe.return_value = False
@@ -271,8 +282,9 @@ class TestCompra(unittest.TestCase):
         )
         self.m_vender.assert_not_called()
         self.m_creditar_bonus.assert_not_called()
+        self.assertIsNone(self.estado.buscar("cid-11", "LA3001", "2026-12-01", "joao"))
 
-    def test_12_sell_409_devolve_sold_out(self) -> None:
+    def test_12_sell_409_devolve_sold_out_e_grava_not_sold(self) -> None:
         self.m_vender.return_value = Resultado(
             tipo="definitivo",
             status=409,
@@ -285,8 +297,12 @@ class TestCompra(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(corpo, {"error": "sold-out"})
         self.m_creditar_bonus.assert_not_called()
+        linha = self.estado.buscar("cid-12", "LA3001", "2026-12-01", "joao")
+        self.assertIsNotNone(linha)
+        assert linha is not None
+        self.assertEqual(linha.estado, "NOT_SOLD")
 
-    def test_13_sell_incerto_levanta_runtime_error(self) -> None:
+    def test_13_sell_incerto_devolve_202(self) -> None:
         self.m_vender.return_value = Resultado(
             tipo="incerto",
             status=500,
@@ -295,9 +311,135 @@ class TestCompra(unittest.TestCase):
             ms=15.0,
         )
 
-        with self.assertRaises(RuntimeError):
-            comprar("LA3001", "2026-12-01", "joao", "cid-13")
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-13")
+        self.assertEqual(status, 202)
+        self.assertEqual(corpo["outcome"], "unknown")
+        self.assertNotIn("transactionId", corpo)
+        self.assertIn("sale-unconfirmed", corpo["degradations"])
+        self.m_registrar.assert_not_called()
         self.m_creditar_bonus.assert_not_called()
+        self.m_vender.assert_called_once()
+        linha = self.estado.buscar("cid-13", "LA3001", "2026-12-01", "joao")
+        assert linha is not None
+        self.assertEqual(linha.estado, "UNCERTAIN")
+
+    def test_14_sell_ok_persiste_sold_registra_venda_e_credita_bonus(self) -> None:
+        status, _ = comprar("LA3001", "2026-12-01", "joao", "cid-14")
+        self.assertEqual(status, 201)
+        self.m_registrar.assert_called_once()
+        self.m_vender.assert_called_once()
+        linha = self.estado.buscar("cid-14", "LA3001", "2026-12-01", "joao")
+        assert linha is not None
+        self.assertEqual(linha.estado, "SOLD")
+        self.assertEqual(linha.bonus_estado, "CREDITADO")
+
+    def test_15_sell_falha_segura_libera_linha_e_permite_retentar(self) -> None:
+        self.m_vender.side_effect = [
+            Resultado(
+                tipo="falha_segura",
+                status=None,
+                dados=None,
+                motivo="conexao_recusada",
+                ms=5.0,
+            ),
+            _ok_venda("tx-recuperada"),
+        ]
+
+        status1, corpo1 = comprar("LA3001", "2026-12-01", "joao", "cid-15")
+        self.assertEqual(status1, 503)
+        self.assertEqual(corpo1["error"], "sell-unavailable")
+        self.assertEqual(corpo1["outcome"], "not-sold")
+        self.assertIsNone(self.estado.buscar("cid-15", "LA3001", "2026-12-01", "joao"))
+
+        status2, corpo2 = comprar("LA3001", "2026-12-01", "joao", "cid-15")
+        self.assertEqual(status2, 201)
+        self.assertEqual(corpo2["transactionId"], "tx-recuperada")
+        self.assertEqual(self.m_vender.call_count, 2)
+
+    def test_16_repeticao_apos_201_devolve_mesma_resposta_sem_chamar_dependencias(self) -> None:
+        status1, corpo1 = comprar("LA3001", "2026-12-01", "joao", "cid-16")
+        self.assertEqual(status1, 201)
+
+        status2, corpo2 = comprar("LA3001", "2026-12-01", "joao", "cid-16")
+        self.assertEqual(status2, 201)
+        self.assertEqual(corpo2, corpo1)
+        self.assertEqual(corpo2["valueUSD"], Decimal("200.00"))
+        self.assertEqual(corpo2["valueBRL"], Decimal("1100.00"))
+        self.assertEqual(corpo2["rate"], Decimal("5.50"))
+        self.m_buscar_voo.assert_called_once()
+        self.m_obter_taxa.assert_called_once()
+        self.m_vender.assert_called_once()
+        self.m_creditar_bonus.assert_called_once()
+
+    def test_17_repeticao_apos_202_e_apos_409_sem_chamar_vender(self) -> None:
+        self.m_vender.return_value = Resultado(
+            tipo="incerto", status=None, dados=None, motivo="timeout", ms=1500.0
+        )
+        s1, c1 = comprar("LA3001", "2026-12-01", "joao", "cid-17a")
+        s2, c2 = comprar("LA3001", "2026-12-01", "joao", "cid-17a")
+        self.assertEqual(s1, 202)
+        self.assertEqual(s2, 202)
+        self.assertEqual(c2, c1)
+        self.m_vender.assert_called_once()
+
+        self.m_vender.reset_mock()
+        self.m_vender.return_value = Resultado(
+            tipo="definitivo", status=409, dados=None, motivo="status_409", ms=10.0
+        )
+        s3, c3 = comprar("LA3001", "2026-12-01", "joao", "cid-17b")
+        s4, c4 = comprar("LA3001", "2026-12-01", "joao", "cid-17b")
+        self.assertEqual(s3, 409)
+        self.assertEqual(s4, 409)
+        self.assertEqual(c4, c3)
+        self.m_vender.assert_called_once()
+
+    def test_18_linha_selling_pre_existente_devolve_503_em_andamento(self) -> None:
+        self.estado.iniciar_compra("cid-18", "LA3001", "2026-12-01", "joao")
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-18")
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            corpo,
+            {"error": "purchase-in-progress", "correlationId": "cid-18"},
+        )
+        self.assertNotIn("outcome", corpo)
+        self.m_buscar_voo.assert_not_called()
+        self.m_obter_taxa.assert_not_called()
+        self.m_vender.assert_not_called()
+        self.m_creditar_bonus.assert_not_called()
+
+    def test_19_mesmo_cid_com_user_diferente_executa_nova_compra(self) -> None:
+        s1, _ = comprar("LA3001", "2026-12-01", "joao", "cid-19")
+        s2, _ = comprar("LA3001", "2026-12-01", "maria", "cid-19")
+        self.assertEqual(s1, 201)
+        self.assertEqual(s2, 201)
+        self.assertEqual(self.m_vender.call_count, 2)
+
+    def test_20_excecao_inesperada_no_sell_sobe_e_marca_uncertain(self) -> None:
+        self.m_vender.side_effect = RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            comprar("LA3001", "2026-12-01", "joao", "cid-20")
+
+        linha = self.estado.buscar("cid-20", "LA3001", "2026-12-01", "joao")
+        self.assertIsNotNone(linha)
+        assert linha is not None
+        self.assertEqual(linha.estado, "UNCERTAIN")
+
+    def test_21_bonus_falha_apos_venda_ok_mantem_sold_pendente_e_registrado(self) -> None:
+        self.m_creditar_bonus.return_value = Resultado(
+            tipo="incerto", status=500, dados=None, motivo="status_500", ms=10.0
+        )
+
+        with self.assertRaises(RuntimeError):
+            comprar("LA3001", "2026-12-01", "joao", "cid-21")
+
+        self.m_registrar.assert_called_once()
+        linha = self.estado.buscar("cid-21", "LA3001", "2026-12-01", "joao")
+        self.assertIsNotNone(linha)
+        assert linha is not None
+        self.assertEqual(linha.estado, "SOLD")
+        self.assertEqual(linha.bonus_estado, "PENDENTE")
 
 
 if __name__ == "__main__":
