@@ -1,8 +1,18 @@
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
+import random
+import time
+from app.caches import CACHE_PRECO, CACHE_TAXA
 from app.clientes import buscar_voo, creditar_bonus, obter_taxa, vender
 from app.config import CONFIG
+from app.instrumentacao import log
 from app.prazo import Prazo
+from app.resposta import (
+    PRICE_FROM_CACHE,
+    RATE_FROM_CACHE,
+    corpo_201,
+    recusa_503,
+)
 from app.vendas import registrar
 
 
@@ -14,42 +24,102 @@ def _timestamp_utc_ms() -> str:
     )
 
 
+def _dormir_ms(ms: float) -> None:
+    if ms > 0:
+        time.sleep(ms / 1000.0)
+
+
+def _aleatorio_ms(maximo: float) -> float:
+    if maximo <= 0:
+        return 0.0
+    return random.uniform(0.0, maximo)
+
+
 def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, object]]:
     prazo = Prazo(CONFIG.deadline_ms, CONFIG.deadline_margin_ms)
+    degradations: list[str] = []
 
-    t_voo = prazo.timeout_ms(
-        CONFIG.flight_timeout_ms,
-        reserva_ms=CONFIG.convert_timeout_ms + CONFIG.sell_timeout_ms,
+    # 1) /flight
+    reserva_voo_ms = CONFIG.convert_timeout_ms + CONFIG.sell_timeout_ms
+    entrada_preco_inicial = CACHE_PRECO.obter(flight, day, CONFIG.price_cache_max_age_s)
+    nominal_voo_ms = (
+        CONFIG.flight_timeout_ms
+        if entrada_preco_inicial is not None
+        else CONFIG.deadline_ms
     )
+    t_voo = prazo.timeout_ms(nominal_voo_ms, reserva_ms=reserva_voo_ms)
     if t_voo is None:
-        raise RuntimeError("AirlinesHub /flight: sem_tempo")
-    res_voo = buscar_voo(flight, day, cid, t_voo)
-    if res_voo.tipo == "definitivo" and res_voo.status == 404:
-        return 404, {"error": "not-found"}
-    if res_voo.tipo != "ok" or res_voo.dados is None:
-        raise RuntimeError(f"AirlinesHub /flight: {res_voo.motivo}")
-    price_usd = res_voo.dados["priceUSD"]
-    assert isinstance(price_usd, Decimal)
+        entrada_preco = CACHE_PRECO.obter(flight, day, CONFIG.price_cache_max_age_s)
+        if entrada_preco is None:
+            return 503, recusa_503("no-time", cid)
+        assert isinstance(entrada_preco.valor, Decimal)
+        price_usd = entrada_preco.valor
+        degradations.append(PRICE_FROM_CACHE)
+    else:
+        res_voo = buscar_voo(flight, day, cid, t_voo)
+        if res_voo.tipo == "definitivo" and res_voo.status == 404:
+            return 404, {"error": "not-found"}
+        if res_voo.tipo == "ok" and res_voo.dados is not None:
+            price_usd = res_voo.dados["priceUSD"]
+            assert isinstance(price_usd, Decimal)
+            CACHE_PRECO.guardar(flight, day, price_usd)
+        else:
+            entrada_preco = CACHE_PRECO.obter(flight, day, CONFIG.price_cache_max_age_s)
+            if entrada_preco is None:
+                return 503, recusa_503("price-unavailable", cid)
+            assert isinstance(entrada_preco.valor, Decimal)
+            price_usd = entrada_preco.valor
+            degradations.append(PRICE_FROM_CACHE)
 
-    t_taxa = prazo.timeout_ms(
-        CONFIG.convert_timeout_ms,
-        reserva_ms=CONFIG.sell_timeout_ms,
-    )
-    if t_taxa is None:
-        raise RuntimeError("Exchange /convert: sem_tempo")
-    res_taxa = obter_taxa(cid, t_taxa)
-    if res_taxa.tipo != "ok" or res_taxa.dados is None:
-        raise RuntimeError(f"Exchange /convert: {res_taxa.motivo}")
-    rate = res_taxa.dados["rate"]
-    as_of = res_taxa.dados["asOf"]
-    assert isinstance(rate, Decimal)
-    assert isinstance(as_of, str)
+    # 2) /convert
+    rate: Decimal | None = None
+    as_of: str | None = None
+    tentativas_realizadas = 0
 
+    for tentativa in range(CONFIG.convert_max_attempts):
+        if tentativa > 0:
+            espera_ms = float(CONFIG.retry_backoff_ms) + _aleatorio_ms(
+                float(CONFIG.retry_jitter_ms)
+            )
+            if prazo.restante_ms() - espera_ms - CONFIG.sell_timeout_ms < 1:
+                break
+            _dormir_ms(espera_ms)
+
+        t_taxa = prazo.timeout_ms(
+            CONFIG.convert_timeout_ms,
+            reserva_ms=CONFIG.sell_timeout_ms,
+        )
+        if t_taxa is None:
+            break
+
+        tentativas_realizadas += 1
+        res_taxa = obter_taxa(cid, t_taxa)
+        if res_taxa.tipo == "ok" and res_taxa.dados is not None:
+            rate = res_taxa.dados["rate"]
+            as_of = res_taxa.dados["asOf"]
+            assert isinstance(rate, Decimal)
+            assert isinstance(as_of, str)
+            CACHE_TAXA.guardar(rate, as_of)
+            break
+
+    if rate is None or as_of is None:
+        entrada_taxa = CACHE_TAXA.obter(CONFIG.rate_cache_max_age_s)
+        if entrada_taxa is not None:
+            assert isinstance(entrada_taxa.valor, Decimal)
+            assert isinstance(entrada_taxa.as_of, str)
+            rate = entrada_taxa.valor
+            as_of = entrada_taxa.as_of
+            degradations.append(RATE_FROM_CACHE)
+        else:
+            erro_taxa = "no-time" if tentativas_realizadas == 0 else "rate-unavailable"
+            return 503, recusa_503(erro_taxa, cid)
+
+    # 3) /sell
     if not prazo.cabe(CONFIG.sell_min_start_ms):
-        raise RuntimeError("sem tempo para /sell")
+        return 503, recusa_503("no-time", cid)
     t_venda = prazo.timeout_ms(CONFIG.sell_timeout_ms)
     if t_venda is None:
-        raise RuntimeError("sem tempo para /sell")
+        return 503, recusa_503("no-time", cid)
     res_venda = vender(flight, day, cid, t_venda)
     if res_venda.tipo == "definitivo" and res_venda.status == 409:
         return 409, {"error": "sold-out"}
@@ -57,6 +127,7 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
         raise RuntimeError(f"AirlinesHub /sell: {res_venda.motivo}")
     transaction_id = res_venda.dados["transactionId"]
 
+    # 4) /bonus
     bonus = int(price_usd)
     t_bonus = prazo.timeout_ms(CONFIG.bonus_inline_timeout_ms)
     if t_bonus is None:
@@ -83,15 +154,19 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
         }
     )
 
-    corpo: dict[str, object] = {
-        "transactionId": transaction_id,
-        "flight": flight,
-        "day": day,
-        "user": user,
-        "valueUSD": price_usd,
-        "valueBRL": value_brl,
-        "rate": rate,
-        "rateAsOf": as_of,
-        "bonus": bonus,
-    }
+    if degradations:
+        log("compra.degradada", cid=cid, degradations=list(degradations))
+
+    corpo = corpo_201(
+        transaction_id=transaction_id,
+        flight=flight,
+        day=day,
+        user=user,
+        price_usd=price_usd,
+        value_brl=value_brl,
+        rate=rate,
+        rate_as_of=as_of,
+        bonus=bonus,
+        degradations=degradations,
+    )
     return 201, corpo

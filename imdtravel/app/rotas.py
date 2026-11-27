@@ -6,7 +6,7 @@ from decimal import Decimal
 from flask import Flask, Response, g, jsonify, request
 from werkzeug.exceptions import HTTPException
 from app.compra import comprar
-from app.config import SALES_DIR
+from app.config import CONFIG, SALES_DIR
 from app.instrumentacao import log, registrar_instrumentacao
 from app.vendas import listar
 
@@ -87,6 +87,10 @@ def buy_ticket():
             status=201,
             mimetype="application/json",
         )
+    if status == 503:
+        resp = jsonify(resposta)
+        resp.headers["Retry-After"] = str(CONFIG.retry_after_s)
+        return resp, 503
     return jsonify(resposta), status
 
 
