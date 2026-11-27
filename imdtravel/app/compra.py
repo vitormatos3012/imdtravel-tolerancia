@@ -1,12 +1,9 @@
-import json
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from app.clientes import buscar_voo, creditar_bonus, obter_taxa, vender
+from app.config import CONFIG
+from app.prazo import Prazo
 from app.vendas import registrar
-
-
-def _eh_2xx(status_code: int) -> bool:
-    return 200 <= status_code < 300
 
 
 def _timestamp_utc_ms() -> str:
@@ -18,33 +15,55 @@ def _timestamp_utc_ms() -> str:
 
 
 def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, object]]:
-    resp_voo = buscar_voo(flight, day, cid)
-    if resp_voo.status_code == 404:
+    prazo = Prazo(CONFIG.deadline_ms, CONFIG.deadline_margin_ms)
+
+    t_voo = prazo.timeout_ms(
+        CONFIG.flight_timeout_ms,
+        reserva_ms=CONFIG.convert_timeout_ms + CONFIG.sell_timeout_ms,
+    )
+    if t_voo is None:
+        raise RuntimeError("AirlinesHub /flight: sem_tempo")
+    res_voo = buscar_voo(flight, day, cid, t_voo)
+    if res_voo.tipo == "definitivo" and res_voo.status == 404:
         return 404, {"error": "not-found"}
-    if not _eh_2xx(resp_voo.status_code):
-        raise RuntimeError(f"AirlinesHub /flight retornou status {resp_voo.status_code}")
-    dados_voo = json.loads(resp_voo.text, parse_float=Decimal)
-    price_usd = dados_voo["priceUSD"]
+    if res_voo.tipo != "ok" or res_voo.dados is None:
+        raise RuntimeError(f"AirlinesHub /flight: {res_voo.motivo}")
+    price_usd = res_voo.dados["priceUSD"]
+    assert isinstance(price_usd, Decimal)
 
-    resp_taxa = obter_taxa(cid)
-    if not _eh_2xx(resp_taxa.status_code):
-        raise RuntimeError(f"Exchange /convert retornou status {resp_taxa.status_code}")
-    dados_taxa = json.loads(resp_taxa.text, parse_float=Decimal)
-    rate = dados_taxa["rate"]
-    as_of = dados_taxa["asOf"]
+    t_taxa = prazo.timeout_ms(
+        CONFIG.convert_timeout_ms,
+        reserva_ms=CONFIG.sell_timeout_ms,
+    )
+    if t_taxa is None:
+        raise RuntimeError("Exchange /convert: sem_tempo")
+    res_taxa = obter_taxa(cid, t_taxa)
+    if res_taxa.tipo != "ok" or res_taxa.dados is None:
+        raise RuntimeError(f"Exchange /convert: {res_taxa.motivo}")
+    rate = res_taxa.dados["rate"]
+    as_of = res_taxa.dados["asOf"]
+    assert isinstance(rate, Decimal)
+    assert isinstance(as_of, str)
 
-    resp_venda = vender(flight, day, cid)
-    if resp_venda.status_code == 409:
+    if not prazo.cabe(CONFIG.sell_min_start_ms):
+        raise RuntimeError("sem tempo para /sell")
+    t_venda = prazo.timeout_ms(CONFIG.sell_timeout_ms)
+    if t_venda is None:
+        raise RuntimeError("sem tempo para /sell")
+    res_venda = vender(flight, day, cid, t_venda)
+    if res_venda.tipo == "definitivo" and res_venda.status == 409:
         return 409, {"error": "sold-out"}
-    if not _eh_2xx(resp_venda.status_code):
-        raise RuntimeError(f"AirlinesHub /sell retornou status {resp_venda.status_code}")
-    dados_venda = resp_venda.json()
-    transaction_id = dados_venda["transactionId"]
+    if res_venda.tipo != "ok" or res_venda.dados is None:
+        raise RuntimeError(f"AirlinesHub /sell: {res_venda.motivo}")
+    transaction_id = res_venda.dados["transactionId"]
 
     bonus = int(price_usd)
-    resp_bonus = creditar_bonus(user, bonus, cid)
-    if not _eh_2xx(resp_bonus.status_code):
-        raise RuntimeError(f"Fidelity /bonus retornou status {resp_bonus.status_code}")
+    t_bonus = prazo.timeout_ms(CONFIG.bonus_inline_timeout_ms)
+    if t_bonus is None:
+        raise RuntimeError("Fidelity /bonus: sem_tempo")
+    res_bonus = creditar_bonus(user, bonus, cid, t_bonus)
+    if res_bonus.tipo != "ok":
+        raise RuntimeError(f"Fidelity /bonus: {res_bonus.motivo}")
 
     value_brl = (Decimal(str(price_usd)) * Decimal(str(rate))).quantize(
         Decimal("0.01"),
