@@ -13,6 +13,7 @@ from app.resposta import (
     PRICE_FROM_CACHE,
     RATE_FROM_CACHE,
     corpo_201,
+    STATUS_VENDA_INCERTA,
     corpo_202,
     corpo_em_andamento,
     json_exato,
@@ -52,12 +53,14 @@ def _responder_de_linha(linha: Linha, cid: str) -> tuple[int, dict[str, object]]
 
 
 def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, object]]:
+    # O prazo conta da chegada da requisição 0 (P1): é a primeira instrução.
+    prazo = Prazo(CONFIG.deadline_ms, CONFIG.deadline_margin_ms)
+
     # 0) Idempotência
     linha_existente = ESTADO.buscar(cid, flight, day, user)
     if linha_existente is not None:
         return _responder_de_linha(linha_existente, cid)
 
-    prazo = Prazo(CONFIG.deadline_ms, CONFIG.deadline_margin_ms)
     degradations: list[str] = []
 
     # 1) /flight
@@ -218,12 +221,12 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
                 flight,
                 day,
                 user,
-                202,
+                STATUS_VENDA_INCERTA,
                 json_exato(corpo_incerto),
             )
             concluida = True
             log("venda.incerta", cid=cid, motivo=res_venda.motivo)
-            return 202, corpo_incerto
+            return STATUS_VENDA_INCERTA, corpo_incerto
     finally:
         if not concluida:
             ESTADO.concluir_incerta(
@@ -231,7 +234,7 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
                 flight,
                 day,
                 user,
-                202,
+                STATUS_VENDA_INCERTA,
                 json_exato(corpo_202(cid, flight, day, user, degradations)),
             )
 

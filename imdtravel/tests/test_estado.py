@@ -130,7 +130,7 @@ class TestEstado(unittest.TestCase):
         linha1 = self.estado.buscar("cid-orfa-1", "LA3001", "2026-12-01", "joao")
         assert linha1 is not None
         self.assertEqual(linha1.estado, "UNCERTAIN")
-        self.assertEqual(linha1.resposta_status, 202)
+        self.assertEqual(linha1.resposta_status, 200)
         assert linha1.resposta_corpo is not None
         corpo1 = json.loads(linha1.resposta_corpo)
         self.assertIn("sale-unconfirmed", corpo1["degradations"])

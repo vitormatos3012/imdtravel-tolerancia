@@ -4,6 +4,8 @@ import json
 PRICE_FROM_CACHE = "price-from-cache"
 RATE_FROM_CACHE = "rate-from-cache"
 SALE_UNCONFIRMED = "sale-unconfirmed"
+# O professor definiu (P4): quando não se sabe se a venda aconteceu, a resposta é HTTP 200.
+STATUS_VENDA_INCERTA = 200
 
 
 def json_exato(corpo: dict[str, object]) -> str:

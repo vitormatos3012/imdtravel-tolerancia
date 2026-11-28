@@ -13,6 +13,7 @@ from app.clientes import Resultado
 from app.compra import comprar
 from app.config import CONFIG
 from app.estado import Estado
+from app.prazo import Prazo
 
 
 class _RelogioFalso:
@@ -302,7 +303,7 @@ class TestCompra(unittest.TestCase):
         assert linha is not None
         self.assertEqual(linha.estado, "NOT_SOLD")
 
-    def test_13_sell_incerto_devolve_202(self) -> None:
+    def test_13_sell_incerto_devolve_200_com_outcome_unknown(self) -> None:
         self.m_vender.return_value = Resultado(
             tipo="incerto",
             status=500,
@@ -312,7 +313,7 @@ class TestCompra(unittest.TestCase):
         )
 
         status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-13")
-        self.assertEqual(status, 202)
+        self.assertEqual(status, 200)
         self.assertEqual(corpo["outcome"], "unknown")
         self.assertNotIn("transactionId", corpo)
         self.assertIn("sale-unconfirmed", corpo["degradations"])
@@ -371,14 +372,14 @@ class TestCompra(unittest.TestCase):
         self.m_vender.assert_called_once()
         self.m_creditar_bonus.assert_called_once()
 
-    def test_17_repeticao_apos_202_e_apos_409_sem_chamar_vender(self) -> None:
+    def test_17_repeticao_apos_incerta_e_apos_409_sem_chamar_vender(self) -> None:
         self.m_vender.return_value = Resultado(
             tipo="incerto", status=None, dados=None, motivo="timeout", ms=1500.0
         )
         s1, c1 = comprar("LA3001", "2026-12-01", "joao", "cid-17a")
         s2, c2 = comprar("LA3001", "2026-12-01", "joao", "cid-17a")
-        self.assertEqual(s1, 202)
-        self.assertEqual(s2, 202)
+        self.assertEqual(s1, 200)
+        self.assertEqual(s2, 200)
         self.assertEqual(c2, c1)
         self.m_vender.assert_called_once()
 
@@ -440,6 +441,26 @@ class TestCompra(unittest.TestCase):
         assert linha is not None
         self.assertEqual(linha.estado, "SOLD")
         self.assertEqual(linha.bonus_estado, "PENDENTE")
+
+
+    def test_22_prazo_e_criado_antes_de_consultar_o_estado(self) -> None:
+        ordem: list[str] = []
+        buscar_real = self.estado.buscar
+
+        def buscar_espiao(cid: str, flight: str, day: str, user: str):
+            ordem.append("buscar")
+            return buscar_real(cid, flight, day, user)
+
+        def prazo_espiao(total_ms: int, margem_ms: int = 0):
+            ordem.append("prazo")
+            return Prazo(total_ms, margem_ms)
+
+        with patch.object(self.estado, "buscar", side_effect=buscar_espiao):
+            with patch("app.compra.Prazo", side_effect=prazo_espiao):
+                status, _ = comprar("LA3001", "2026-12-01", "joao", "cid-22")
+
+        self.assertEqual(status, 201)
+        self.assertEqual(ordem[:2], ["prazo", "buscar"])
 
 
 if __name__ == "__main__":

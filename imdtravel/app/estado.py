@@ -8,7 +8,7 @@ import threading
 import time
 from app.config import CONFIG
 from app.instrumentacao import log
-from app.resposta import corpo_202, json_exato
+from app.resposta import STATUS_VENDA_INCERTA, corpo_202, json_exato
 
 _ESQUEMA_SQL = """
 CREATE TABLE IF NOT EXISTS compras (
@@ -364,12 +364,12 @@ class Estado:
                         """
                         UPDATE compras
                         SET estado = 'UNCERTAIN',
-                            resposta_status = 202,
+                            resposta_status = ?,
                             resposta_corpo = ?,
                             atualizado_em = ?
                         WHERE id = ? AND estado = 'SELLING'
                         """,
-                        (corpo, agora, row_id),
+                        (STATUS_VENDA_INCERTA, corpo, agora, row_id),
                     )
                     cids_recuperados.append(cid)
                 conn.execute("COMMIT")
