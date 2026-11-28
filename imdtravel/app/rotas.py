@@ -3,10 +3,12 @@ import tempfile
 import time
 from flask import Flask, Response, g, jsonify, request
 from werkzeug.exceptions import HTTPException
+from app.admissao import ADMISSAO
+from app.bonus_worker import WORKER
 from app.compra import comprar
 from app.config import CONFIG, SALES_DIR
 from app.instrumentacao import log, registrar_instrumentacao
-from app.resposta import json_exato
+from app.resposta import json_exato, recusa_503
 from app.vendas import listar
 
 app = Flask(__name__)
@@ -33,11 +35,25 @@ def _texto_nao_vazio(valor: object) -> bool:
     return isinstance(valor, str) and bool(valor.strip())
 
 
+def _resposta_503(corpo: dict[str, object]):
+    resp = jsonify(corpo)
+    resp.headers["Retry-After"] = str(CONFIG.retry_after_s)
+    return resp, 503
+
+
 @app.get("/health")
 def health():
     ok, reason = _check_sales_dir()
     if not ok:
         return jsonify({"status": "down", "reason": reason}), 503
+
+    # Vigilância do worker (Watchdog 18 e Restart 31): o healthcheck do compose chama
+    # este endpoint periodicamente e faz o papel de vigia.
+    if not WORKER.esta_vivo():
+        WORKER.iniciar()
+        log("bonus.worker.reiniciado")
+        if not WORKER.esta_vivo():
+            return jsonify({"status": "down", "reason": "bonus_worker_dead"}), 503
 
     uptime_s = int(time.monotonic() - _START_TIME)
     return jsonify({"status": "ok", "uptimeS": uptime_s}), 200
@@ -61,12 +77,20 @@ def buy_ticket():
     ):
         return jsonify({"error": "invalid-request"}), 400
 
-    status, resposta = comprar(
-        corpo["flight"].strip(),
-        corpo["day"].strip(),
-        corpo["user"].strip(),
-        g.cid,
-    )
+    if not ADMISSAO.tentar_entrar():
+        log("admissao.recusou", em_andamento=ADMISSAO.em_andamento())
+        return _resposta_503(recusa_503("overloaded", g.cid))
+
+    try:
+        status, resposta = comprar(
+            corpo["flight"].strip(),
+            corpo["day"].strip(),
+            corpo["user"].strip(),
+            g.cid,
+        )
+    finally:
+        ADMISSAO.sair()
+
     if status == 201:
         return Response(
             json_exato(resposta),
@@ -74,9 +98,7 @@ def buy_ticket():
             mimetype="application/json",
         )
     if status == 503:
-        resp = jsonify(resposta)
-        resp.headers["Retry-After"] = str(CONFIG.retry_after_s)
-        return resp, 503
+        return _resposta_503(resposta)
     return jsonify(resposta), status
 
 

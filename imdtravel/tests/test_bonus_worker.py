@@ -304,6 +304,37 @@ class TestBonusWorker(unittest.TestCase):
         assert linha_final is not None
         self.assertEqual(linha_final.bonus_estado, "CREDITADO")
 
+    def test_j_iniciar_duas_vezes_nao_cria_duas_threads(self) -> None:
+        worker = BonusWorker(self.estado, relogio=self.relogio, aleatorio_ms=lambda _m: 0.0)
+        self.addCleanup(worker.parar)
+
+        worker.iniciar()
+        primeira = worker._thread
+        self.assertIsNotNone(primeira)
+        worker.iniciar()
+
+        self.assertIs(worker._thread, primeira)
+        self.assertTrue(worker.esta_vivo())
+
+        worker.parar()
+        self.assertFalse(worker.esta_vivo())
+
+    def test_k_depois_de_parar_iniciar_cria_thread_nova(self) -> None:
+        worker = BonusWorker(self.estado, relogio=self.relogio, aleatorio_ms=lambda _m: 0.0)
+        self.addCleanup(worker.parar)
+
+        worker.iniciar()
+        primeira = worker._thread
+        worker.parar()
+        self.assertFalse(worker.esta_vivo())
+
+        worker.iniciar()
+        self.assertTrue(worker.esta_vivo())
+        self.assertIsNot(worker._thread, primeira)
+
+        worker.parar()
+        self.assertFalse(worker.esta_vivo())
+
 
 if __name__ == "__main__":
     unittest.main()

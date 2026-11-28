@@ -6,6 +6,7 @@ import time
 from app.caches import CACHE_PRECO, CACHE_TAXA
 from app.clientes import buscar_voo, creditar_bonus, obter_taxa, vender
 from app.config import CONFIG
+from app.disjuntor import DISJUNTORES, MOTIVO_DISJUNTOR_ABERTO, executar
 from app.estado import ESTADO, Linha
 from app.instrumentacao import log
 from app.prazo import Prazo
@@ -81,7 +82,7 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
         price_usd = entrada_preco.valor
         degradations.append(PRICE_FROM_CACHE)
     else:
-        res_voo = buscar_voo(flight, day, cid, t_voo)
+        res_voo = executar("flight", lambda: buscar_voo(flight, day, cid, t_voo))
         if res_voo.tipo == "definitivo" and res_voo.status == 404:
             return 404, {"error": "not-found"}
         if res_voo.tipo == "ok" and res_voo.dados is not None:
@@ -118,13 +119,16 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
             break
 
         tentativas_realizadas += 1
-        res_taxa = obter_taxa(cid, t_taxa)
+        res_taxa = executar("convert", lambda: obter_taxa(cid, t_taxa))
         if res_taxa.tipo == "ok" and res_taxa.dados is not None:
             rate = res_taxa.dados["rate"]
             as_of = res_taxa.dados["asOf"]
             assert isinstance(rate, Decimal)
             assert isinstance(as_of, str)
             CACHE_TAXA.guardar(rate, as_of)
+            break
+        if res_taxa.motivo == MOTIVO_DISJUNTOR_ABERTO:
+            # Falhar rápido: sem backoff e sem segunda tentativa; segue para o cache.
             break
 
     if rate is None or as_of is None:
@@ -152,6 +156,14 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
     if t_venda is None:
         return 503, recusa_503("no-time", cid)
 
+    # Recusas cedo (Fail Fast / admissão): antes de criar a linha, nada foi vendido.
+    if DISJUNTORES["sell"].esta_aberto():
+        log("disjuntor.recusou", alvo="sell")
+        return 503, recusa_503("sell-unavailable", cid)
+    if ESTADO.contar_bonus_pendentes() >= CONFIG.bonus_queue_max:
+        log("admissao.recusou", motivo="fila_bonus_cheia")
+        return 503, recusa_503("overloaded", cid)
+
     criado, existente = ESTADO.iniciar_compra(cid, flight, day, user)
     if not criado:
         assert existente is not None
@@ -159,7 +171,7 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
 
     concluida = False
     try:
-        res_venda = vender(flight, day, cid, t_venda)
+        res_venda = executar("sell", lambda: vender(flight, day, cid, t_venda))
 
         if res_venda.tipo == "ok" and res_venda.dados is not None:
             transaction_id = res_venda.dados["transactionId"]
@@ -246,8 +258,11 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
         motivo_bonus = "sem_tempo"
         bonus_ok = False
     else:
-        res_bonus = creditar_bonus(user, bonus, cid, t_bonus)
-        tentativas_bonus = 1
+        res_bonus = executar(
+            "bonus", lambda: creditar_bonus(user, bonus, cid, t_bonus)
+        )
+        # Disjuntor aberto = não houve chamada.
+        tentativas_bonus = 0 if res_bonus.motivo == MOTIVO_DISJUNTOR_ABERTO else 1
         motivo_bonus = res_bonus.motivo
         bonus_ok = res_bonus.tipo == "ok"
 

@@ -1,5 +1,6 @@
 from decimal import Decimal
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from app.caches import CachePreco, CacheTaxa
 from app.clientes import Resultado
 from app.compra import comprar
 from app.config import CONFIG
+from app.disjuntor import DISJUNTORES, reiniciar_todos
 from app.estado import Estado
 from app.prazo import Prazo
 
@@ -94,6 +96,9 @@ class TestCompra(unittest.TestCase):
         self.addCleanup(self.tmp_dir.cleanup)
 
         self.relogio = _RelogioFalso(1000.0)
+        # Os disjuntores são globais: recriar com o relógio falso a cada teste.
+        reiniciar_todos(self.relogio)
+        self.addCleanup(reiniciar_todos)
         self.cache_preco = CachePreco(relogio=self.relogio)
         self.cache_taxa = CacheTaxa(relogio=self.relogio)
         self.estado = Estado(
@@ -127,6 +132,11 @@ class TestCompra(unittest.TestCase):
 
     def tearDown(self) -> None:
         patch.stopall()
+
+    def _abrir_disjuntor(self, alvo: str) -> None:
+        for _ in range(math.ceil(CONFIG.breaker_threshold)):
+            DISJUNTORES[alvo].registrar(False)
+        self.assertEqual(DISJUNTORES[alvo].estado(), "aberto")
 
     def test_01_tudo_ok_sem_degradacao_preenche_caches(self) -> None:
         status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-1")
@@ -556,6 +566,114 @@ class TestCompra(unittest.TestCase):
         assert linha is not None and linha.resposta_corpo is not None
         persistido = json.loads(linha.resposta_corpo)
         self.assertEqual(persistido["degradations"], ["bonus-deferred"])
+
+    # ---- Passo 7: disjuntores e recusas cedo ----
+
+    def test_26_disjuntor_flight_aberto_com_cache_valido_usa_cache_sem_rede(self) -> None:
+        self.cache_preco.guardar("LA3001", "2026-12-01", Decimal("180.00"))
+        self._abrir_disjuntor("flight")
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-26")
+
+        self.assertEqual(status, 201)
+        self.assertIs(corpo["degraded"], True)
+        self.assertEqual(corpo["degradations"], ["price-from-cache"])
+        self.assertEqual(corpo["valueUSD"], Decimal("180.00"))
+        self.m_buscar_voo.assert_not_called()
+
+    def test_27_disjuntor_flight_aberto_com_cache_frio_recusa_503(self) -> None:
+        self._abrir_disjuntor("flight")
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-27")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(corpo["error"], "price-unavailable")
+        self.assertEqual(corpo["outcome"], "not-sold")
+        self.m_buscar_voo.assert_not_called()
+        self.m_vender.assert_not_called()
+
+    def test_28_disjuntor_convert_aberto_com_cache_de_taxa_usa_cache_sem_rede(self) -> None:
+        self.cache_taxa.guardar(Decimal("5.25"), "2026-11-27T09:30:00Z")
+        self._abrir_disjuntor("convert")
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-28")
+
+        self.assertEqual(status, 201)
+        self.assertIs(corpo["degraded"], True)
+        self.assertEqual(corpo["degradations"], ["rate-from-cache"])
+        self.assertEqual(corpo["rate"], Decimal("5.25"))
+        self.m_obter_taxa.assert_not_called()
+        self.m_dormir.assert_not_called()
+
+    def test_29_disjuntor_sell_aberto_recusa_sem_vender_e_sem_criar_linha(self) -> None:
+        self._abrir_disjuntor("sell")
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-29")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            corpo,
+            {
+                "error": "sell-unavailable",
+                "outcome": "not-sold",
+                "correlationId": "cid-29",
+            },
+        )
+        self.m_vender.assert_not_called()
+        self.m_creditar_bonus.assert_not_called()
+        self.assertIsNone(self.estado.buscar("cid-29", "LA3001", "2026-12-01", "joao"))
+
+    def test_30_disjuntor_bonus_aberto_adia_bonus_sem_chamar_creditar(self) -> None:
+        self._abrir_disjuntor("bonus")
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-30")
+
+        self.assertEqual(status, 201)
+        self.assertIs(corpo["degraded"], True)
+        self.assertEqual(corpo["degradations"], ["bonus-deferred"])
+        self.m_creditar_bonus.assert_not_called()
+        linha = self.estado.buscar("cid-30", "LA3001", "2026-12-01", "joao")
+        assert linha is not None
+        self.assertEqual(linha.estado, "SOLD")
+        self.assertEqual(linha.bonus_estado, "PENDENTE")
+        self.assertEqual(linha.bonus_tentativas, 0)
+
+    def test_31_fila_de_bonus_cheia_recusa_overloaded_sem_vender(self) -> None:
+        with patch.object(
+            self.estado,
+            "contar_bonus_pendentes",
+            return_value=CONFIG.bonus_queue_max,
+        ):
+            status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-31")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(
+            corpo,
+            {
+                "error": "overloaded",
+                "outcome": "not-sold",
+                "correlationId": "cid-31",
+            },
+        )
+        self.m_vender.assert_not_called()
+        self.m_creditar_bonus.assert_not_called()
+        self.assertIsNone(self.estado.buscar("cid-31", "LA3001", "2026-12-01", "joao"))
+
+    def test_32_apos_falhas_seguidas_do_flight_o_disjuntor_abre_e_nao_chama_mais(self) -> None:
+        falhas = math.ceil(CONFIG.breaker_threshold)
+        self.cache_preco.guardar("LA3001", "2026-12-01", Decimal("180.00"))
+        self.m_buscar_voo.return_value = _falha_voo()
+
+        for i in range(falhas):
+            status, corpo = comprar("LA3001", "2026-12-01", "joao", f"cid-32-{i}")
+            self.assertEqual(status, 201)
+            self.assertEqual(corpo["degradations"], ["price-from-cache"])
+        self.assertEqual(self.m_buscar_voo.call_count, falhas)
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-32-final")
+        self.assertEqual(status, 201)
+        self.assertEqual(corpo["degradations"], ["price-from-cache"])
+        self.assertEqual(self.m_buscar_voo.call_count, falhas)
 
 
 if __name__ == "__main__":

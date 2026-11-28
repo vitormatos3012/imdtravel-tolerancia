@@ -51,6 +51,7 @@ class BonusWorker:
         self._dormir_s = dormir_s
         self._evento_parada = threading.Event()
         self._thread: threading.Thread | None = None
+        self._trava_thread = threading.Lock()
 
     def rodada(self) -> bool:
         agora = self._relogio()
@@ -148,15 +149,18 @@ class BonusWorker:
                 self._esperar(0.2)
 
     def iniciar(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._evento_parada.clear()
-        self._thread = threading.Thread(
-            target=self._executar,
-            name="bonus-worker",
-            daemon=True,
-        )
-        self._thread.start()
+        # Idempotente e protegido por trava: /health pode chamar em paralelo
+        # (Flask com threaded=True) e nunca devem nascer duas threads.
+        with self._trava_thread:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._evento_parada.clear()
+            self._thread = threading.Thread(
+                target=self._executar,
+                name="bonus-worker",
+                daemon=True,
+            )
+            self._thread.start()
 
     def parar(self) -> None:
         self._evento_parada.set()
