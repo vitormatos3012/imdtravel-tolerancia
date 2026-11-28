@@ -53,10 +53,33 @@ class Linha:
     bonus_estado: str
     resposta_status: int | None
     resposta_corpo: str | None
+    bonus_tentativas: int
+
+
+@dataclass(frozen=True)
+class BonusPendente:
+    cid: str
+    flight: str
+    day: str
+    user: str
+    bonus: int
+    tentativas: int
 
 
 def _linha_de_tupla(registro: tuple[object, ...]) -> Linha:
-    cid, flight, day, user, estado, tx_id, bonus, bonus_estado, status, corpo = registro
+    (
+        cid,
+        flight,
+        day,
+        user,
+        estado,
+        tx_id,
+        bonus,
+        bonus_estado,
+        status,
+        corpo,
+        bonus_tentativas,
+    ) = registro
     assert isinstance(cid, str)
     assert isinstance(flight, str)
     assert isinstance(day, str)
@@ -67,6 +90,7 @@ def _linha_de_tupla(registro: tuple[object, ...]) -> Linha:
     assert isinstance(bonus_estado, str)
     assert status is None or isinstance(status, int)
     assert corpo is None or isinstance(corpo, str)
+    assert isinstance(bonus_tentativas, int)
     return Linha(
         cid=cid,
         flight=flight,
@@ -78,6 +102,7 @@ def _linha_de_tupla(registro: tuple[object, ...]) -> Linha:
         bonus_estado=bonus_estado,
         resposta_status=status,
         resposta_corpo=corpo,
+        bonus_tentativas=bonus_tentativas,
     )
 
 
@@ -89,9 +114,19 @@ class Estado:
     ou NOT_SOLD) junto com a resposta serializada para idempotência.
     """
 
-    def __init__(self, caminho: str, relogio: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        caminho: str,
+        relogio: Callable[[], float] = time.time,
+        bonus_lease_s: float | None = None,
+    ) -> None:
         self._caminho = caminho
         self._relogio = relogio
+        self._bonus_lease_s = (
+            bonus_lease_s
+            if bonus_lease_s is not None
+            else CONFIG.deadline_ms / 1000.0 + 1.0
+        )
         self._lock_esquema = threading.Lock()
         self._esquema_pronto = False
 
@@ -126,7 +161,8 @@ class Estado:
         cur = conn.execute(
             """
             SELECT cid, flight, day, user, estado, transaction_id,
-                   bonus, bonus_estado, resposta_status, resposta_corpo
+                   bonus, bonus_estado, resposta_status, resposta_corpo,
+                   bonus_tentativas
             FROM compras
             WHERE cid = ? AND flight = ? AND day = ? AND user = ?
             """,
@@ -190,7 +226,7 @@ class Estado:
         corpo: str,
     ) -> None:
         agora = _agora_iso_utc()
-        proxima_em = self._relogio()
+        proxima_em = self._relogio() + self._bonus_lease_s
         with contextlib.closing(self._conectar()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -339,6 +375,128 @@ class Estado:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
+
+    def registrar_bonus_adiado(
+        self,
+        cid: str,
+        flight: str,
+        day: str,
+        user: str,
+        tentativas: int,
+        proxima_em: float,
+        status: int,
+        corpo: str,
+    ) -> None:
+        agora = _agora_iso_utc()
+        with contextlib.closing(self._conectar()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    UPDATE compras
+                    SET bonus_tentativas = ?,
+                        bonus_proxima_em = ?,
+                        resposta_status = ?,
+                        resposta_corpo = ?,
+                        atualizado_em = ?
+                    WHERE cid = ? AND flight = ? AND day = ? AND user = ?
+                      AND bonus_estado = 'PENDENTE'
+                    """,
+                    (
+                        tentativas,
+                        proxima_em,
+                        status,
+                        corpo,
+                        agora,
+                        cid,
+                        flight,
+                        day,
+                        user,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
+    def proximo_bonus_vencido(self, agora: float) -> BonusPendente | None:
+        with contextlib.closing(self._conectar()) as conn:
+            cur = conn.execute(
+                """
+                SELECT cid, flight, day, user, bonus, bonus_tentativas
+                FROM compras
+                WHERE bonus_estado = 'PENDENTE'
+                  AND bonus_proxima_em IS NOT NULL
+                  AND bonus_proxima_em <= ?
+                ORDER BY bonus_proxima_em ASC, id ASC
+                LIMIT 1
+                """,
+                (agora,),
+            )
+            registro = cur.fetchone()
+            if registro is None:
+                return None
+            cid, flight, day, user, bonus, tentativas = registro
+            assert isinstance(cid, str)
+            assert isinstance(flight, str)
+            assert isinstance(day, str)
+            assert isinstance(user, str)
+            assert isinstance(bonus, int)
+            assert isinstance(tentativas, int)
+            return BonusPendente(
+                cid=cid,
+                flight=flight,
+                day=day,
+                user=user,
+                bonus=bonus,
+                tentativas=tentativas,
+            )
+
+    def reagendar_bonus(
+        self,
+        cid: str,
+        flight: str,
+        day: str,
+        user: str,
+        tentativas: int,
+        proxima_em: float,
+    ) -> None:
+        agora = _agora_iso_utc()
+        with contextlib.closing(self._conectar()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    """
+                    UPDATE compras
+                    SET bonus_tentativas = ?,
+                        bonus_proxima_em = ?,
+                        atualizado_em = ?
+                    WHERE cid = ? AND flight = ? AND day = ? AND user = ?
+                      AND bonus_estado = 'PENDENTE'
+                    """,
+                    (tentativas, proxima_em, agora, cid, flight, day, user),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+
+    def contar_bonus_pendentes(self) -> int:
+        with contextlib.closing(self._conectar()) as conn:
+            cur = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM compras
+                WHERE bonus_estado = 'PENDENTE'
+                """
+            )
+            registro = cur.fetchone()
+            assert registro is not None
+            total = registro[0]
+            assert isinstance(total, int)
+            return total
 
     def recuperar_orfas(self) -> list[str]:
         agora = _agora_iso_utc()

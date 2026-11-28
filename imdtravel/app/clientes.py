@@ -123,6 +123,33 @@ def _extrair_transaction_id(texto: str) -> str | None:
         return None
 
 
+def _extrair_cids_pontos(texto: str) -> frozenset[str] | None:
+    try:
+        dados = json.loads(
+            texto,
+            parse_float=Decimal,
+            parse_constant=_rejeitar_constante_json,
+        )
+        if not isinstance(dados, dict) or "entries" not in dados:
+            return None
+
+        entries = dados["entries"]
+        if not isinstance(entries, list):
+            return None
+
+        cids: set[str] = set()
+        for item in entries:
+            if not isinstance(item, dict):
+                return None
+            cid_bruto = item.get("cid")
+            if isinstance(cid_bruto, str) and cid_bruto.strip():
+                cids.add(cid_bruto)
+
+        return frozenset(cids)
+    except (ValueError, KeyError, TypeError, ArithmeticError, InvalidOperation):
+        return None
+
+
 def buscar_voo(
     flight: str,
     day: str,
@@ -380,3 +407,65 @@ def creditar_bonus(
     motivo = f"status_{status}"
     log("dependencia.resposta", ms=ms, alvo=alvo, path=path, status=status, tipo=tipo, motivo=motivo)
     return Resultado(tipo=tipo, status=status, dados=None, motivo=motivo, ms=ms)
+
+
+def consultar_pontos(
+    user: str,
+    cid: str,
+    timeout_ms: float,
+    base_url: str | None = None,
+) -> Resultado:
+    alvo = "fidelity"
+    path = "/points"
+    url_base = (base_url if base_url is not None else FIDELITY_URL).rstrip("/")
+    url = f"{url_base}{path}"
+    inicio = time.monotonic()
+
+    # O timeout do requests vale por fase (conexão e espera de bytes), não como prazo total;
+    # para as nossas falhas (nenhum byte chega) isso equivale a um limite total.
+    try:
+        resp = requests.get(
+            url,
+            params={"user": user},
+            headers={"X-Correlation-Id": cid},
+            timeout=timeout_ms / 1000,
+        )
+    except requests.exceptions.Timeout as exc:
+        ms = round((time.monotonic() - inicio) * 1000, 2)
+        tipo: TipoResultado = "falha_segura"
+        motivo = "timeout"
+        log("dependencia.falha", ms=ms, alvo=alvo, path=path, erro=str(exc), tipo=tipo, motivo=motivo)
+        return Resultado(tipo=tipo, status=None, dados=None, motivo=motivo, ms=ms)
+    except requests.exceptions.RequestException as exc:
+        ms = round((time.monotonic() - inicio) * 1000, 2)
+        tipo = "falha_segura"
+        motivo = "conexao"
+        log("dependencia.falha", ms=ms, alvo=alvo, path=path, erro=str(exc), tipo=tipo, motivo=motivo)
+        return Resultado(tipo=tipo, status=None, dados=None, motivo=motivo, ms=ms)
+
+    ms = round((time.monotonic() - inicio) * 1000, 2)
+    status = resp.status_code
+
+    if status != 200:
+        tipo = "falha_segura"
+        motivo = f"status_{status}"
+        log("dependencia.resposta", ms=ms, alvo=alvo, path=path, status=status, tipo=tipo, motivo=motivo)
+        return Resultado(tipo=tipo, status=status, dados=None, motivo=motivo, ms=ms)
+
+    cids = _extrair_cids_pontos(resp.text)
+    if cids is None:
+        tipo = "falha_segura"
+        motivo = "resposta_invalida"
+        log("dependencia.resposta", ms=ms, alvo=alvo, path=path, status=status, tipo=tipo, motivo=motivo)
+        return Resultado(tipo=tipo, status=status, dados=None, motivo=motivo, ms=ms)
+
+    tipo = "ok"
+    motivo = "ok"
+    log("dependencia.resposta", ms=ms, alvo=alvo, path=path, status=status, tipo=tipo, motivo=motivo)
+    return Resultado(
+        tipo=tipo,
+        status=status,
+        dados={"cids": cids},
+        motivo=motivo,
+        ms=ms,
+    )

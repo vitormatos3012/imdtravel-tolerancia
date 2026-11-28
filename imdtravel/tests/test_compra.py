@@ -1,4 +1,5 @@
 from decimal import Decimal
+import json
 import os
 import tempfile
 import unittest
@@ -325,8 +326,9 @@ class TestCompra(unittest.TestCase):
         self.assertEqual(linha.estado, "UNCERTAIN")
 
     def test_14_sell_ok_persiste_sold_registra_venda_e_credita_bonus(self) -> None:
-        status, _ = comprar("LA3001", "2026-12-01", "joao", "cid-14")
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-14")
         self.assertEqual(status, 201)
+        self.assertNotIn("degraded", corpo)
         self.m_registrar.assert_called_once()
         self.m_vender.assert_called_once()
         linha = self.estado.buscar("cid-14", "LA3001", "2026-12-01", "joao")
@@ -427,21 +429,25 @@ class TestCompra(unittest.TestCase):
         assert linha is not None
         self.assertEqual(linha.estado, "UNCERTAIN")
 
-    def test_21_bonus_falha_apos_venda_ok_mantem_sold_pendente_e_registrado(self) -> None:
+    def test_21_bonus_falha_apos_venda_ok_devolve_201_com_bonus_deferred(self) -> None:
         self.m_creditar_bonus.return_value = Resultado(
             tipo="incerto", status=500, dados=None, motivo="status_500", ms=10.0
         )
 
-        with self.assertRaises(RuntimeError):
-            comprar("LA3001", "2026-12-01", "joao", "cid-21")
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-21")
 
+        self.assertEqual(status, 201)
+        self.assertIs(corpo["degraded"], True)
+        self.assertEqual(corpo["degradations"], ["bonus-deferred"])
         self.m_registrar.assert_called_once()
         linha = self.estado.buscar("cid-21", "LA3001", "2026-12-01", "joao")
         self.assertIsNotNone(linha)
         assert linha is not None
         self.assertEqual(linha.estado, "SOLD")
         self.assertEqual(linha.bonus_estado, "PENDENTE")
-
+        self.assertEqual(linha.bonus_tentativas, 1)
+        assert linha.resposta_corpo is not None
+        self.assertIn("bonus-deferred", linha.resposta_corpo)
 
     def test_22_prazo_e_criado_antes_de_consultar_o_estado(self) -> None:
         ordem: list[str] = []
@@ -461,6 +467,95 @@ class TestCompra(unittest.TestCase):
 
         self.assertEqual(status, 201)
         self.assertEqual(ordem[:2], ["prazo", "buscar"])
+
+    def test_23_bonus_falha_segura_conexao_recusada_devolve_201_com_bonus_deferred(self) -> None:
+        self.m_creditar_bonus.return_value = Resultado(
+            tipo="falha_segura",
+            status=None,
+            dados=None,
+            motivo="conexao_recusada",
+            ms=5.0,
+        )
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-23")
+
+        self.assertEqual(status, 201)
+        self.assertIs(corpo["degraded"], True)
+        self.assertEqual(corpo["degradations"], ["bonus-deferred"])
+        linha = self.estado.buscar("cid-23", "LA3001", "2026-12-01", "joao")
+        assert linha is not None
+        self.assertEqual(linha.estado, "SOLD")
+        self.assertEqual(linha.bonus_estado, "PENDENTE")
+        self.assertEqual(linha.bonus_tentativas, 1)
+        assert linha.resposta_corpo is not None
+        self.assertIn("bonus-deferred", linha.resposta_corpo)
+
+    def test_24_bonus_sem_tempo_devolve_201_com_bonus_deferred_sem_chamar_creditar(self) -> None:
+        class _PrazoSemTempoBonus:
+            def __init__(self, total_ms: int, margem_ms: int = 0) -> None:
+                self._chamadas = 0
+
+            def timeout_ms(
+                self, nominal_ms: int, reserva_ms: int = 0
+            ) -> float | None:
+                self._chamadas += 1
+                # 1=flight, 2=convert, 3=sell, 4=bonus
+                if self._chamadas <= 3:
+                    return float(nominal_ms)
+                return None
+
+            def cabe(self, minimo_ms: int) -> bool:
+                return True
+
+            def restante_ms(self) -> float:
+                return 2000.0
+
+        with patch("app.compra.Prazo", _PrazoSemTempoBonus):
+            status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-24")
+
+        self.assertEqual(status, 201)
+        self.assertIs(corpo["degraded"], True)
+        self.assertEqual(corpo["degradations"], ["bonus-deferred"])
+        self.m_creditar_bonus.assert_not_called()
+        linha = self.estado.buscar("cid-24", "LA3001", "2026-12-01", "joao")
+        assert linha is not None
+        self.assertEqual(linha.estado, "SOLD")
+        self.assertEqual(linha.bonus_estado, "PENDENTE")
+        self.assertEqual(linha.bonus_tentativas, 0)
+
+    def test_25_repeticao_apos_201_com_bonus_adiado_devolve_mesmo_corpo_com_degradacao(self) -> None:
+        self.m_creditar_bonus.return_value = Resultado(
+            tipo="falha_segura",
+            status=None,
+            dados=None,
+            motivo="conexao_recusada",
+            ms=5.0,
+        )
+
+        status1, corpo1 = comprar("LA3001", "2026-12-01", "joao", "cid-25")
+        self.assertEqual(status1, 201)
+        self.assertEqual(corpo1["degradations"], ["bonus-deferred"])
+
+        self.m_buscar_voo.reset_mock()
+        self.m_obter_taxa.reset_mock()
+        self.m_vender.reset_mock()
+        self.m_creditar_bonus.reset_mock()
+
+        status2, corpo2 = comprar("LA3001", "2026-12-01", "joao", "cid-25")
+        self.assertEqual(status2, 201)
+        self.assertEqual(corpo2, corpo1)
+        self.assertIs(corpo2["degraded"], True)
+        self.assertEqual(corpo2["degradations"], ["bonus-deferred"])
+        self.m_buscar_voo.assert_not_called()
+        self.m_obter_taxa.assert_not_called()
+        self.m_vender.assert_not_called()
+        self.m_creditar_bonus.assert_not_called()
+
+        # Garante que o corpo persistido no banco é JSON válido com bonus-deferred
+        linha = self.estado.buscar("cid-25", "LA3001", "2026-12-01", "joao")
+        assert linha is not None and linha.resposta_corpo is not None
+        persistido = json.loads(linha.resposta_corpo)
+        self.assertEqual(persistido["degradations"], ["bonus-deferred"])
 
 
 if __name__ == "__main__":

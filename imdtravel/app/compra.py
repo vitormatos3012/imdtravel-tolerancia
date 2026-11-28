@@ -10,10 +10,11 @@ from app.estado import ESTADO, Linha
 from app.instrumentacao import log
 from app.prazo import Prazo
 from app.resposta import (
+    BONUS_DEFERRED,
     PRICE_FROM_CACHE,
     RATE_FROM_CACHE,
-    corpo_201,
     STATUS_VENDA_INCERTA,
+    corpo_201,
     corpo_202,
     corpo_em_andamento,
     json_exato,
@@ -238,17 +239,48 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
                 json_exato(corpo_202(cid, flight, day, user, degradations)),
             )
 
-    # 4) /bonus
+    # 4) /bonus (Deferrable Work: falha nunca falha a compra)
     t_bonus = prazo.timeout_ms(CONFIG.bonus_inline_timeout_ms)
     if t_bonus is None:
-        raise RuntimeError("Fidelity /bonus: sem_tempo")
-    res_bonus = creditar_bonus(user, bonus, cid, t_bonus)
-    if res_bonus.tipo != "ok":
-        raise RuntimeError(f"Fidelity /bonus: {res_bonus.motivo}")
+        tentativas_bonus = 0
+        motivo_bonus = "sem_tempo"
+        bonus_ok = False
+    else:
+        res_bonus = creditar_bonus(user, bonus, cid, t_bonus)
+        tentativas_bonus = 1
+        motivo_bonus = res_bonus.motivo
+        bonus_ok = res_bonus.tipo == "ok"
 
-    ESTADO.marcar_bonus_creditado(cid, flight, day, user)
+    if bonus_ok:
+        ESTADO.marcar_bonus_creditado(cid, flight, day, user)
+        if degradations:
+            log("compra.degradada", cid=cid, degradations=list(degradations))
+        return 201, corpo
 
-    if degradations:
-        log("compra.degradada", cid=cid, degradations=list(degradations))
-
-    return 201, corpo
+    degradations_adiada = [*degradations, BONUS_DEFERRED]
+    corpo_novo = corpo_201(
+        transaction_id=transaction_id,
+        flight=flight,
+        day=day,
+        user=user,
+        price_usd=price_usd,
+        value_brl=value_brl,
+        rate=rate,
+        rate_as_of=as_of,
+        bonus=bonus,
+        degradations=degradations_adiada,
+    )
+    proxima_em = time.time() + CONFIG.bonus_backoff_initial_ms / 1000.0
+    ESTADO.registrar_bonus_adiado(
+        cid,
+        flight,
+        day,
+        user,
+        tentativas_bonus,
+        proxima_em,
+        201,
+        json_exato(corpo_novo),
+    )
+    log("bonus.adiado", cid=cid, tentativas=tentativas_bonus, motivo=motivo_bonus)
+    log("compra.degradada", cid=cid, degradations=list(degradations_adiada))
+    return 201, corpo_novo
