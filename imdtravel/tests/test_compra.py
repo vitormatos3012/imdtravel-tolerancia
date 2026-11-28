@@ -2,6 +2,7 @@ from decimal import Decimal
 import json
 import math
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,7 @@ from app.config import CONFIG
 from app.disjuntor import DISJUNTORES, reiniciar_todos
 from app.estado import Estado
 from app.prazo import Prazo
+from app.resposta import json_exato
 
 
 class _RelogioFalso:
@@ -509,8 +511,8 @@ class TestCompra(unittest.TestCase):
                 self, nominal_ms: int, reserva_ms: int = 0
             ) -> float | None:
                 self._chamadas += 1
-                # 1=flight, 2=convert, 3=sell, 4=bonus
-                if self._chamadas <= 3:
+                # 1=flight, 2=convert, 3=sell, 4=sell (recalculado depois do INSERT), 5=bonus
+                if self._chamadas <= 4:
                     return float(nominal_ms)
                 return None
 
@@ -674,6 +676,106 @@ class TestCompra(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertEqual(corpo["degradations"], ["price-from-cache"])
         self.assertEqual(self.m_buscar_voo.call_count, falhas)
+
+
+    def test_26_falha_de_sqlite_apos_venda_confirmada_devolve_200_unknown_sem_500(self) -> None:
+        with patch.object(
+            self.estado,
+            "concluir_vendida",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-26")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(corpo["outcome"], "unknown")
+        self.assertIs(corpo["degraded"], True)
+        self.assertIn("sale-unconfirmed", corpo["degradations"])
+        self.assertNotIn("transactionId", corpo)
+        self.m_vender.assert_called_once()
+        self.m_registrar.assert_not_called()
+        self.m_creditar_bonus.assert_not_called()
+        linha = self.estado.buscar("cid-26", "LA3001", "2026-12-01", "joao")
+        self.assertIsNotNone(linha)
+        assert linha is not None
+        self.assertEqual(linha.estado, "UNCERTAIN")
+
+    def test_27_sqlite_falha_ate_ao_marcar_incerta_ainda_devolve_200_unknown(self) -> None:
+        with patch.object(
+            self.estado,
+            "concluir_vendida",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ), patch.object(
+            self.estado,
+            "concluir_incerta",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-27")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(corpo["outcome"], "unknown")
+        self.m_vender.assert_called_once()
+
+    def test_28_falha_ao_registrar_em_sales_mantem_201_e_estado_sold(self) -> None:
+        self.m_registrar.side_effect = OSError("disco cheio")
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-28")
+
+        self.assertEqual(status, 201)
+        self.assertEqual(corpo["transactionId"], "tx-100")
+        self.m_creditar_bonus.assert_called_once()
+        linha = self.estado.buscar("cid-28", "LA3001", "2026-12-01", "joao")
+        self.assertIsNotNone(linha)
+        assert linha is not None
+        self.assertEqual(linha.estado, "SOLD")
+
+    def test_29_prazo_esgotado_depois_do_insert_libera_linha_e_nao_vende(self) -> None:
+        prazo_falso = MagicMock()
+        prazo_falso.timeout_ms.side_effect = [1000.0, 500.0, 1500.0, 1500.0]
+        # True antes de criar a linha; False depois do INSERT (o SQLite demorou).
+        prazo_falso.cabe.side_effect = [True, False]
+
+        with patch("app.compra.Prazo", return_value=prazo_falso):
+            status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-29")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(corpo["error"], "no-time")
+        self.assertEqual(corpo["outcome"], "not-sold")
+        self.m_vender.assert_not_called()
+        self.m_creditar_bonus.assert_not_called()
+        self.assertIsNone(self.estado.buscar("cid-29", "LA3001", "2026-12-01", "joao"))
+
+    def test_30_conflito_com_linha_que_sumiu_devolve_503_em_andamento_sem_500(self) -> None:
+        with patch.object(self.estado, "iniciar_compra", return_value=(False, None)):
+            status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-30")
+
+        self.assertEqual(status, 503)
+        self.assertNotIn("outcome", corpo)
+        self.assertEqual(corpo["correlationId"], "cid-30")
+        self.m_vender.assert_not_called()
+
+    def test_31_preco_fora_de_escala_devolve_503_sem_vender(self) -> None:
+        self.m_buscar_voo.return_value = _ok_voo("1E+30")
+
+        status, corpo = comprar("LA3001", "2026-12-01", "joao", "cid-31")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(corpo["error"], "price-unavailable")
+        self.assertEqual(corpo["outcome"], "not-sold")
+        self.m_vender.assert_not_called()
+        self.assertIsNone(self.estado.buscar("cid-31", "LA3001", "2026-12-01", "joao"))
+
+    def test_32_repeticao_devolve_exatamente_os_mesmos_bytes_do_201(self) -> None:
+        self.m_buscar_voo.return_value = _ok_voo("350.50")
+
+        status1, corpo1 = comprar("LA3001", "2026-12-01", "joao", "cid-32")
+        status2, corpo2 = comprar("LA3001", "2026-12-01", "joao", "cid-32")
+
+        self.assertEqual((status1, status2), (201, 201))
+        texto1 = json_exato(corpo1)
+        texto2 = json_exato(corpo2)
+        # Comparar o TEXTO: Decimal("350.50") == Decimal("350.5"), então comparar dicts não basta.
+        self.assertEqual(texto2, texto1)
+        self.assertIn('"valueUSD":350.50', texto2)
 
 
 if __name__ == "__main__":

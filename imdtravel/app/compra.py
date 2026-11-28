@@ -1,7 +1,8 @@
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import json
 import random
+import sqlite3
 import time
 from app.caches import CACHE_PRECO, CACHE_TAXA
 from app.clientes import buscar_voo, creditar_bonus, obter_taxa, vender
@@ -52,6 +53,28 @@ def _responder_de_linha(linha: Linha, cid: str) -> tuple[int, dict[str, object]]
         assert isinstance(corpo, dict)
         return linha.resposta_status, corpo
     return 503, corpo_em_andamento(cid)
+
+
+def _tentar_concluir_incerta(
+    cid: str,
+    flight: str,
+    day: str,
+    user: str,
+    corpo_incerto: dict[str, object],
+) -> None:
+    # Se nem isso puder ser gravado, a falha de SQLite NÃO pode trocar a exceção original
+    # nem virar 500 sozinha: fica no log, e recuperar_orfas trata a linha SELLING na subida.
+    try:
+        ESTADO.concluir_incerta(
+            cid,
+            flight,
+            day,
+            user,
+            STATUS_VENDA_INCERTA,
+            json_exato(corpo_incerto),
+        )
+    except sqlite3.Error as exc:
+        log("estado.falha", cid=cid, operacao="concluir_incerta", erro=str(exc))
 
 
 def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, object]]:
@@ -144,10 +167,15 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
             return 503, recusa_503(erro_taxa, cid)
 
     bonus = int(price_usd)
-    value_brl = (Decimal(str(price_usd)) * Decimal(str(rate))).quantize(
-        Decimal("0.01"),
-        rounding=ROUND_HALF_UP,
-    )
+    try:
+        value_brl = (Decimal(str(price_usd)) * Decimal(str(rate))).quantize(
+            Decimal("0.01"),
+            rounding=ROUND_HALF_UP,
+        )
+    except InvalidOperation:
+        # Preço fora de escala (ex.: 1E+30): o cálculo não cabe na precisão. Nada foi enviado.
+        log("preco.invalido", cid=cid, motivo="valor_fora_de_escala")
+        return 503, recusa_503("price-unavailable", cid)
 
     # 3) /sell
     if not prazo.cabe(CONFIG.sell_min_start_ms):
@@ -166,8 +194,18 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
 
     criado, existente = ESTADO.iniciar_compra(cid, flight, day, user)
     if not criado:
-        assert existente is not None
+        if existente is None:
+            # A linha sumiu entre o conflito e a leitura (outra requisição fez liberar):
+            # nada foi vendido por esta; pedir para tentar de novo.
+            return 503, corpo_em_andamento(cid)
         return _responder_de_linha(existente, cid)
+
+    # O INSERT pode ter esperado pelo SQLite: recalcular o tempo restante AGORA (P1).
+    # Nada foi enviado ainda, então apagar a linha e recusar é seguro.
+    t_venda = prazo.timeout_ms(CONFIG.sell_timeout_ms)
+    if not prazo.cabe(CONFIG.sell_min_start_ms) or t_venda is None:
+        ESTADO.liberar(cid, flight, day, user)
+        return 503, recusa_503("no-time", cid)
 
     concluida = False
     try:
@@ -188,29 +226,52 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
                 bonus=bonus,
                 degradations=degradations,
             )
-            ESTADO.concluir_vendida(
-                cid,
-                flight,
-                day,
-                user,
-                transaction_id,
-                bonus,
-                201,
-                json_exato(corpo),
-            )
+            try:
+                ESTADO.concluir_vendida(
+                    cid,
+                    flight,
+                    day,
+                    user,
+                    transaction_id,
+                    bonus,
+                    201,
+                    json_exato(corpo),
+                )
+            except sqlite3.Error as exc:
+                # A venda FOI confirmada, mas o estado não foi gravado. Nunca 500: responde
+                # "unknown" (honesto) e deixa o transactionId no log para conferência manual.
+                log(
+                    "venda.confirmada.sem_estado",
+                    cid=cid,
+                    transactionId=transaction_id,
+                    erro=str(exc),
+                )
+                corpo_sem_estado = corpo_202(cid, flight, day, user, degradations)
+                _tentar_concluir_incerta(cid, flight, day, user, corpo_sem_estado)
+                concluida = True
+                return STATUS_VENDA_INCERTA, corpo_sem_estado
             concluida = True
-            registrar(
-                {
-                    "correlationId": cid,
-                    "transactionId": transaction_id,
-                    "flight": flight,
-                    "day": day,
-                    "user": user,
-                    "valueUSD": float(price_usd),
-                    "valueBRL": float(value_brl),
-                    "ts": _timestamp_utc_ms(),
-                }
-            )
+            try:
+                registrar(
+                    {
+                        "correlationId": cid,
+                        "transactionId": transaction_id,
+                        "flight": flight,
+                        "day": day,
+                        "user": user,
+                        "valueUSD": float(price_usd),
+                        "valueBRL": float(value_brl),
+                        "ts": _timestamp_utc_ms(),
+                    }
+                )
+            except OSError as exc:
+                # A venda está confirmada e o estado gravado (SOLD): a resposta continua 201.
+                log(
+                    "vendas.registro_falhou",
+                    cid=cid,
+                    transactionId=transaction_id,
+                    erro=str(exc),
+                )
         elif res_venda.tipo == "definitivo" and res_venda.status == 409:
             corpo_esgotado: dict[str, object] = {"error": "sold-out"}
             ESTADO.concluir_nao_vendida(
@@ -242,13 +303,12 @@ def comprar(flight: str, day: str, user: str, cid: str) -> tuple[int, dict[str, 
             return STATUS_VENDA_INCERTA, corpo_incerto
     finally:
         if not concluida:
-            ESTADO.concluir_incerta(
+            _tentar_concluir_incerta(
                 cid,
                 flight,
                 day,
                 user,
-                STATUS_VENDA_INCERTA,
-                json_exato(corpo_202(cid, flight, day, user, degradations)),
+                corpo_202(cid, flight, day, user, degradations),
             )
 
     # 4) /bonus (Deferrable Work: falha nunca falha a compra)

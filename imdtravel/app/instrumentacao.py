@@ -21,7 +21,8 @@ class _JsonFormatter(logging.Formatter):
         extras = getattr(record, "extras", None)
         if isinstance(extras, dict):
             for key, value in extras.items():
-                if key not in payload:
+                # Fora de uma requisição (worker) o "cid" do payload é None: o cid explícito vale.
+                if key not in payload or (key == "cid" and payload["cid"] is None):
                     payload[key] = value
         return json.dumps(payload, ensure_ascii=False, default=str)
 

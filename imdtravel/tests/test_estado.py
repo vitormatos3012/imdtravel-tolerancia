@@ -70,7 +70,7 @@ class TestEstado(unittest.TestCase):
     def test_04_concluir_incerta_e_nao_vendida_so_atuam_em_selling(self) -> None:
         self.estado.iniciar_compra("cid-inc", "LA3001", "2026-12-01", "joao")
         self.estado.concluir_incerta(
-            "cid-inc", "LA3001", "2026-12-01", "joao", 202, '{"outcome":"unknown"}'
+            "cid-inc", "LA3001", "2026-12-01", "joao", 200, '{"outcome":"unknown"}'
         )
         linha_inc = self.estado.buscar("cid-inc", "LA3001", "2026-12-01", "joao")
         assert linha_inc is not None
@@ -89,7 +89,7 @@ class TestEstado(unittest.TestCase):
             "cid-sold", "LA3001", "2026-12-01", "joao", "tx-1", 100, 201, "{}"
         )
         self.estado.concluir_incerta(
-            "cid-sold", "LA3001", "2026-12-01", "joao", 202, '{"outcome":"unknown"}'
+            "cid-sold", "LA3001", "2026-12-01", "joao", 200, '{"outcome":"unknown"}'
         )
         self.estado.concluir_nao_vendida(
             "cid-sold", "LA3001", "2026-12-01", "joao", 409, '{"error":"sold-out"}'
